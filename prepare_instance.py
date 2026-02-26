@@ -4,11 +4,11 @@ Meta 800 — TAIGA Instance Downloader
 
 Downloads and prepares dataset instances from TAIGA for QA evaluation.
 Reads rubrics directly from JSON files (no job metadata API call).
-Only downloads injected_repo (no git clone of original repo).
+Downloads injected_repo and clones original_repo for diff analysis.
 
 Optimizations:
 - Rubric extraction from JSON files (no API call for job metadata)
-- Removed git clone step (only injected_repo needed for core 20% analysis)
+- Shallow git clone (--depth 1) for original repo
 - Cached JSON data loading
 
 Author: brian.k @ Turing
@@ -28,6 +28,8 @@ import time
 from datetime import datetime
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Thread
 
 # ---------------------------------------------------
 # CONFIG
@@ -245,15 +247,27 @@ def get_problem_version_id(job_id, problem_id):
     raise ValueError(f"No problem_uuid found for problem_id {problem_id} in job {job_id}")
 
 
-def download_preloaded_files(problem_version_id, dest_path):
-    """Download the injected repo tar.gz via TAIGA API."""
+def download_preloaded_files(problem_version_id, dest_path, progress_callback=None):
+    """Download the injected repo tar.gz via TAIGA API with progress reporting."""
     headers = get_auth_headers()
     url = f"{TAIGA_BASE_URL}/api/problem-crud/{problem_version_id}/download-preloaded-files"
-    r = requests.get(url, headers=headers, timeout=300)
+
+    # Stream download to show progress
+    r = requests.get(url, headers=headers, timeout=300, stream=True)
     r.raise_for_status()
+
+    total_size = int(r.headers.get('content-length', 0))
+    downloaded = 0
+
     with open(dest_path, "wb") as f:
-        f.write(r.content)
-    return len(r.content)
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback and total_size > 0:
+                    progress_callback(downloaded, total_size)
+
+    return downloaded
 
 
 def extract_injected_repo(tar_path, dest_dir):
@@ -355,17 +369,42 @@ def validate_extraction(injected_dir):
     return issues
 
 
-# Git clone removed - we only need injected_repo for core 20% analysis
+def clone_original_repo(problem_id, dest_dir):
+    """Clone the original (clean) repo from GitHub for diff analysis.
+
+    Args:
+        problem_id: Format is 'owner__repo-NN' (e.g. 'akaihola__darker-02')
+        dest_dir: Path where to clone the repo
+    """
+    # Parse problem_id to extract owner and repo
+    parts = problem_id.rsplit('-', 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid problem_id format: {problem_id} (expected 'owner__repo-NN')")
+
+    repo_part = parts[0]
+    owner_repo = repo_part.replace('__', '/')
+    github_url = f"https://github.com/{owner_repo}.git"
+
+    # Clone with depth 1 for speed (we only need latest state, not full history)
+    cmd = ["git", "clone", "--depth", "1", github_url, str(dest_dir)]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise Exception(f"Git clone timed out for {github_url}")
+    except subprocess.CalledProcessError as e:
+        raise Exception(f"Git clone failed for {github_url}: {e.stderr}")
 
 # ---------------------------------------------------
 # MAIN
 # ---------------------------------------------------
 
-def prepare_one(problem_id, job_id, avg_score, show_details=False):
-    """Prepare a single instance: extract rubric from JSON, download injected repo.
+def prepare_one(problem_id, job_id, avg_score, show_details=False, progress_callback=None):
+    """Prepare a single instance: extract rubric from JSON, download injected repo, clone original repo.
 
     Args:
         show_details: If True, print verbose step-by-step output. If False, minimal output.
+        progress_callback: Optional callback(current, total, status) for download progress.
 
     Returns:
         dict: Summary statistics (size_mb, file_count, issues, warnings)
@@ -378,6 +417,8 @@ def prepare_one(problem_id, job_id, avg_score, show_details=False):
     instance_dir.mkdir(parents=True)
 
     # Step 1: Extract rubric directly from JSON (NO API CALL)
+    if progress_callback:
+        progress_callback(0, 100, "extracting rubric")
     rubric_entries = extract_rubric_from_json(job_id, problem_id)
 
     if not rubric_entries:
@@ -388,23 +429,41 @@ def prepare_one(problem_id, job_id, avg_score, show_details=False):
         json.dump({"rubric": rubric_entries}, f, indent=2)
 
     # Step 2: Get problem_version_id from JSON (NO API CALL)
+    if progress_callback:
+        progress_callback(10, 100, "resolving version")
     problem_version_id = get_problem_version_id(job_id, problem_id)
 
     if not problem_version_id:
         raise ValueError("Could not find problem_version_id in JSON data.")
 
-    # Step 3: Download injected repo
+    # Step 3: Download injected repo with progress
     tar_path = instance_dir / "repo.tar.gz"
-    size = safe_request(download_preloaded_files, problem_version_id, tar_path)
+
+    def download_progress(downloaded, total):
+        if progress_callback:
+            pct = int(10 + (downloaded / total) * 70)  # 10-80% for download
+            progress_callback(pct, 100, f"downloading {downloaded/(1024*1024):.1f}/{total/(1024*1024):.1f}MB")
+
+    size = download_preloaded_files(problem_version_id, tar_path, progress_callback=download_progress)
 
     # Step 4: Extract injected repo
+    if progress_callback:
+        progress_callback(80, 100, "extracting repo")
     injected_repo_dir = instance_dir / "injected_repo"
     extract_injected_repo(tar_path, injected_repo_dir)
     tar_path.unlink()
 
     file_count = sum(1 for _ in injected_repo_dir.rglob("*") if _.is_file())
 
+    # Step 4b: Clone original repo for diff analysis
+    if progress_callback:
+        progress_callback(85, 100, "cloning original repo")
+    original_repo_dir = instance_dir / "original_repo"
+    clone_original_repo(problem_id, original_repo_dir)
+
     # Step 5: Validate extraction integrity
+    if progress_callback:
+        progress_callback(90, 100, "validating")
     issues = validate_extraction(injected_repo_dir)
 
     # Validate rubric structure
@@ -436,6 +495,9 @@ def prepare_one(problem_id, job_id, avg_score, show_details=False):
 
     with open(instance_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
+
+    if progress_callback:
+        progress_callback(100, 100, "complete")
 
     return {
         "size_mb": size / 1024 / 1024,
@@ -471,10 +533,96 @@ def _should_skip_oscillating(row):
     return False, None
 
 
-def main(limit=None):
-    """Read CSV, process rows sequentially. Skip already-downloaded instances.
+def process_single_instance(idx, row, df, store, stats_lock, stats, processed_count_lock, processed_count_ref, total, start_time, max_retries=3):
+    """Process a single instance with retry logic."""
+    from repo_store import get_repo_id, repo_average_ok
+
+    problem_id = row["problem_id"]
+    job_id = row["job_id"]
+    avg_score = _get_score(row)
+
+    # Check skip conditions
+    if avg_score is None:
+        with stats_lock:
+            stats["skipped_no_score"] += 1
+        df.at[idx, "download_status"] = "skipped_no_score"
+        return ('SKIP', problem_id, 'no score', None)
+
+    if not (0.4 <= avg_score <= 0.8):
+        with stats_lock:
+            stats["skipped_score"] += 1
+        df.at[idx, "download_status"] = "skipped_score"
+        return ('SKIP', problem_id, f'score={avg_score:.3f}', None)
+
+    skip_osc, reason_osc = _should_skip_oscillating(row)
+    if skip_osc:
+        with stats_lock:
+            stats["skipped_oscillating"] += 1
+        df.at[idx, "download_status"] = "skipped_oscillating"
+        return ('SKIP', problem_id, reason_osc, None)
+
+    repo_id = get_repo_id(problem_id)
+    avg_ok, avg_val = repo_average_ok(store, repo_id)
+    if not avg_ok:
+        with stats_lock:
+            stats["skipped_repo_average"] += 1
+        df.at[idx, "download_status"] = "skipped_repo_average"
+        return ('SKIP', problem_id, f'repo_avg={avg_val:.3f}', None)
+
+    instance_dir = INSTANCES_DIR / problem_id / job_id
+    if instance_dir.exists() and (instance_dir / "metadata.json").exists():
+        with stats_lock:
+            stats["already_downloaded"] += 1
+        df.at[idx, "download_status"] = "downloaded"
+        return ('CACHE', problem_id, 'already downloaded', None)
+
+    # Try download with retries
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            retry_msg = f"retry:{attempt+1}" if attempt > 0 else ""
+
+            # Progress tracking
+            current_progress = {"status": "starting"}
+
+            def progress_callback(current, total_size, status):
+                current_progress["status"] = status
+
+            result = prepare_one(problem_id, job_id, avg_score, show_details=False, progress_callback=progress_callback)
+
+            with stats_lock:
+                stats["succeeded"] += 1
+                stats["total_size_mb"] += result["size_mb"]
+                stats["total_files"] += result["file_count"]
+
+            df.at[idx, "download_status"] = "downloaded"
+            details = f"{format_size(result['size_mb'] * 1024 * 1024)}, {result['file_count']:,} files"
+            if retry_msg:
+                details = f"{details} {retry_msg}"
+            return ('OK', problem_id, details, result)
+
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+            else:
+                with stats_lock:
+                    stats["failed"] += 1
+                error_msg = last_error[:40]
+                df.at[idx, "download_status"] = f"error: {last_error[:100]}"
+                return ('FAIL', problem_id, f"{error_msg} (retry:{max_retries})", None)
+
+def main(limit=None, parallel=10, max_retries=3):
+    """Read CSV, process rows in parallel with retry logic.
     Applies same score/num_oscillating/repo-average filters as prefilter so we
-    only download instances that can pass prefilter."""
+    only download instances that can pass prefilter.
+
+    Args:
+        limit: Max instances to process
+        parallel: Number of parallel workers (default 10)
+        max_retries: Max retry attempts per instance (default 3)
+    """
     from repo_store import build_store_from_csv, get_repo_id, repo_average_ok
 
     if not CSV_PATH.exists():
@@ -497,11 +645,13 @@ def main(limit=None):
     if limit:
         to_process = to_process.head(limit)
 
-    print_header("TAIGA Instance Downloader", 80)
+    print_header("TAIGA Instance Downloader (Parallel Mode)", 80)
     print(f"{Colors.BOLD}Dataset Overview:{Colors.RESET}")
     print(f"  Total instances in CSV:  {Colors.CYAN}{total:,}{Colors.RESET}")
     print(f"  Already downloaded:      {Colors.GREEN}{total - len(to_process):,}{Colors.RESET}")
     print(f"  To process:              {Colors.YELLOW}{len(to_process):,}{Colors.RESET}{f' {Colors.DIM}(limit={limit}){Colors.RESET}' if limit else ''}")
+    print(f"  Parallel workers:        {Colors.CYAN}{parallel}{Colors.RESET}")
+    print(f"  Max retries:             {Colors.CYAN}{max_retries}{Colors.RESET}")
     print_footer(80)
 
     stats = {
@@ -516,86 +666,116 @@ def main(limit=None):
         "total_files": 0,
     }
 
-    processed_count = 0
+    stats_lock = Lock()
+    processed_count = [0]  # Use list for shared counter
+    processed_count_lock = Lock()
     start_time = time.time()
-    last_print_time = time.time()
 
-    for idx in to_process.index:
-        processed_count += 1
-        row = df.loc[idx]
-        problem_id = row["problem_id"]
-        job_id = row["job_id"]
-        avg_score = _get_score(row)
+    # Active downloads tracking for live status
+    active_downloads = {}
+    active_lock = Lock()
 
-        # Progress indicator
-        progress_pct = (processed_count / len(to_process)) * 100
-        progress_bar = f"[{processed_count}/{len(to_process)}] {progress_pct:5.1f}%"
+    def submit_task(executor, idx, row):
+        """Submit a task and track it."""
+        future = executor.submit(
+            process_single_instance,
+            idx, row, df, store, stats_lock, stats,
+            processed_count_lock, processed_count, len(to_process), start_time, max_retries
+        )
+        with active_lock:
+            active_downloads[future] = (row["problem_id"], time.time())
+        return future
 
-        if avg_score is None:
-            print(f"{progress_bar} SKIP  {problem_id:<45} (no score)")
-            df.at[idx, "download_status"] = "skipped_no_score"
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        # Submit initial batch
+        futures = {}
+        indices_iter = iter(to_process.index)
+
+        for _ in range(min(parallel, len(to_process))):
+            try:
+                idx = next(indices_iter)
+                row = df.loc[idx]
+                future = submit_task(executor, idx, row)
+                futures[future] = idx
+            except StopIteration:
+                break
+
+        # Process results as they complete
+        for future in as_completed(futures):
+            with processed_count_lock:
+                processed_count[0] += 1
+                current_count = processed_count[0]
+
+            # Remove from active tracking
+            with active_lock:
+                if future in active_downloads:
+                    del active_downloads[future]
+
+            # Get result
+            try:
+                status, problem_id, details, result = future.result()
+            except Exception as e:
+                status = 'FAIL'
+                problem_id = f"unknown_{futures[future]}"
+                details = f"exception: {str(e)[:40]}"
+                result = None
+
+            # Progress indicator
+            progress_pct = (current_count / len(to_process)) * 100
+            progress_bar = f"{Colors.DIM}[{current_count:4d}/{len(to_process):4d}]{Colors.RESET} {Colors.BOLD}{progress_pct:6.2f}%{Colors.RESET}"
+
+            # Estimate time remaining
+            elapsed = time.time() - start_time
+            if current_count > 0:
+                avg_time_per_item = elapsed / current_count
+                remaining_items = len(to_process) - current_count
+                eta_seconds = avg_time_per_item * remaining_items
+                eta_str = f"{Colors.DIM}ETA: {format_duration(eta_seconds)}{Colors.RESET}"
+            else:
+                eta_str = ""
+
+            # Print result
+            line = format_status(status, problem_id, details, progress_bar)
+            if status == 'OK':
+                line += f" {eta_str}"
+            print(line)
+
+            # Save CSV after each completion
             df.to_csv(CSV_PATH, index=False)
-            stats["skipped_no_score"] += 1
-            continue
 
-        if not (0.4 <= avg_score <= 0.8):
-            print(f"{progress_bar} SKIP  {problem_id:<45} (score={avg_score:.3f})")
-            df.at[idx, "download_status"] = "skipped_score"
-            df.to_csv(CSV_PATH, index=False)
-            stats["skipped_score"] += 1
-            continue
+            # Submit next task if available
+            try:
+                idx = next(indices_iter)
+                row = df.loc[idx]
+                new_future = submit_task(executor, idx, row)
+                futures[new_future] = idx
+            except StopIteration:
+                pass
 
-        skip_osc, reason_osc = _should_skip_oscillating(row)
-        if skip_osc:
-            print(f"{progress_bar} SKIP  {problem_id:<45} ({reason_osc})")
-            df.at[idx, "download_status"] = "skipped_oscillating"
-            df.to_csv(CSV_PATH, index=False)
-            stats["skipped_oscillating"] += 1
-            continue
+    elapsed_total = time.time() - start_time
 
-        repo_id = get_repo_id(problem_id)
-        avg_ok, avg_val = repo_average_ok(store, repo_id)
-        if not avg_ok:
-            print(f"{progress_bar} SKIP  {problem_id:<45} (repo_avg={avg_val:.3f})")
-            df.at[idx, "download_status"] = "skipped_repo_average"
-            df.to_csv(CSV_PATH, index=False)
-            stats["skipped_repo_average"] += 1
-            continue
-
-        instance_dir = INSTANCES_DIR / problem_id / job_id
-        if instance_dir.exists() and (instance_dir / "metadata.json").exists():
-            print(f"{progress_bar} CACHE {problem_id:<45} (already downloaded)")
-            df.at[idx, "download_status"] = "downloaded"
-            df.to_csv(CSV_PATH, index=False)
-            stats["already_downloaded"] += 1
-            continue
-
-        try:
-            result = prepare_one(problem_id, job_id, avg_score, show_details=False)
-            print(f"{progress_bar} OK    {problem_id:<45} ({result['size_mb']:.1f}MB, {result['file_count']} files)")
-            df.at[idx, "download_status"] = "downloaded"
-            df.to_csv(CSV_PATH, index=False)
-            stats["succeeded"] += 1
-            stats["total_size_mb"] += result["size_mb"]
-            stats["total_files"] += result["file_count"]
-        except Exception as e:
-            error_msg = str(e)[:50]
-            print(f"{progress_bar} FAIL  {problem_id:<45} ({error_msg})")
-            df.at[idx, "download_status"] = f"error: {str(e)[:100]}"
-            df.to_csv(CSV_PATH, index=False)
-            stats["failed"] += 1
-
-    print(f"\n{'='*70}")
-    print(f"Download Complete")
-    print(f"{'='*70}")
-    print(f"Downloaded:        {stats['succeeded']:4d} instances ({stats['total_size_mb']:.1f} MB, {stats['total_files']} files)")
-    print(f"Failed:            {stats['failed']:4d} instances")
-    print(f"Already cached:    {stats['already_downloaded']:4d} instances")
-    print(f"Skipped (score):   {stats['skipped_score']:4d} instances")
-    print(f"Skipped (osc):     {stats['skipped_oscillating']:4d} instances")
-    print(f"Skipped (repo):    {stats['skipped_repo_average']:4d} instances")
-    print(f"Skipped (no data): {stats['skipped_no_score']:4d} instances")
-    print(f"{'='*70}")
+    print_header("Download Complete", 80)
+    print(f"{Colors.BOLD}Results Summary:{Colors.RESET}")
+    print(f"  {Colors.GREEN}Downloaded:{Colors.RESET}        {stats['succeeded']:5,} instances  {Colors.DIM}({format_size(stats['total_size_mb'] * 1024 * 1024)}, {stats['total_files']:,} files){Colors.RESET}")
+    if stats['failed'] > 0:
+        print(f"  {Colors.RED}Failed:{Colors.RESET}            {stats['failed']:5,} instances")
+    if stats['already_downloaded'] > 0:
+        print(f"  {Colors.CYAN}Cached:{Colors.RESET}            {stats['already_downloaded']:5,} instances")
+    print(f"\n{Colors.BOLD}Skipped:{Colors.RESET}")
+    if stats['skipped_score'] > 0:
+        print(f"  {Colors.YELLOW}Score filter:{Colors.RESET}     {stats['skipped_score']:5,} instances  {Colors.DIM}(outside 0.4-0.8 range){Colors.RESET}")
+    if stats['skipped_oscillating'] > 0:
+        print(f"  {Colors.YELLOW}Oscillating:{Colors.RESET}      {stats['skipped_oscillating']:5,} instances  {Colors.DIM}(< 3 oscillations){Colors.RESET}")
+    if stats['skipped_repo_average'] > 0:
+        print(f"  {Colors.YELLOW}Repo average:{Colors.RESET}     {stats['skipped_repo_average']:5,} instances  {Colors.DIM}(repo avg outside range){Colors.RESET}")
+    if stats['skipped_no_score'] > 0:
+        print(f"  {Colors.YELLOW}No score data:{Colors.RESET}    {stats['skipped_no_score']:5,} instances")
+    print(f"\n{Colors.BOLD}Performance:{Colors.RESET}")
+    print(f"  Total time:           {Colors.CYAN}{format_duration(elapsed_total)}{Colors.RESET}")
+    if stats['succeeded'] > 0:
+        print(f"  Avg time per download: {Colors.CYAN}{elapsed_total/stats['succeeded']:.1f}s{Colors.RESET}")
+        print(f"  Download rate:        {Colors.CYAN}{(stats['total_size_mb'] / elapsed_total * 60):.1f} MB/min{Colors.RESET}")
+    print_footer(80)
 
 
 # ---------------------------------------------------
@@ -691,7 +871,6 @@ def run_prefilter(limit=None):
 
     # Build repo store with averages from full CSV (once at start)
     store = build_store_from_csv(CSV_PATH)
-    print("Repo averages computed from full CSV and persisted to data/repo_store.json\n")
 
     candidates = df[
         (df["download_status"] == "downloaded") &
@@ -701,11 +880,18 @@ def run_prefilter(limit=None):
     if limit:
         candidates = candidates.head(limit)
 
-    print(f"\n{'='*70}")
-    print(f"Pre-filter: Deterministic Quality Checks")
-    print(f"{'='*70}")
-    print(f"Candidates to check: {len(candidates)}")
-    print(f"{'='*70}\n")
+    print_header("Pre-filter: Deterministic Quality Checks", 80)
+    print(f"{Colors.BOLD}Configuration:{Colors.RESET}")
+    print(f"  Repo store loaded:   {Colors.GREEN}data/repo_store.json{Colors.RESET}")
+    print(f"  Candidates to check: {Colors.CYAN}{len(candidates):,}{Colors.RESET}")
+    if limit:
+        print(f"  Limit applied:       {Colors.YELLOW}{limit:,}{Colors.RESET}")
+    print(f"\n{Colors.BOLD}Quality Checks:{Colors.RESET}")
+    print(f"  {Colors.DIM}1. Structural integrity (metadata, rubric, directories){Colors.RESET}")
+    print(f"  {Colors.DIM}2. Oscillating count >= {MIN_OSCILLATING}{Colors.RESET}")
+    print(f"  {Colors.DIM}3. Repo average score in [0.4, 0.8]{Colors.RESET}")
+    print(f"  {Colors.DIM}4. Cross-instance bug location deduplication{Colors.RESET}")
+    print_footer(80)
 
     stats = {
         "passed": 0,
@@ -716,6 +902,7 @@ def run_prefilter(limit=None):
     }
 
     processed_count = 0
+    start_time = time.time()
 
     def _reject(idx, problem_id, reason, instance_dir, category):
         stats[category] += 1
@@ -750,7 +937,17 @@ def run_prefilter(limit=None):
         instance_dir = INSTANCES_DIR / problem_id / job_id
 
         progress_pct = (processed_count / len(candidates)) * 100
-        progress_bar = f"[{processed_count}/{len(candidates)}] {progress_pct:5.1f}%"
+        progress_bar = f"{Colors.DIM}[{processed_count:4d}/{len(candidates):4d}]{Colors.RESET} {Colors.BOLD}{progress_pct:6.2f}%{Colors.RESET}"
+
+        # Estimate time remaining
+        elapsed = time.time() - start_time
+        if processed_count > 0:
+            avg_time_per_item = elapsed / processed_count
+            remaining_items = len(candidates) - processed_count
+            eta_seconds = avg_time_per_item * remaining_items
+            eta_str = f"{Colors.DIM}ETA: {format_duration(eta_seconds)}{Colors.RESET}"
+        else:
+            eta_str = ""
 
         # --- Check 0: num_oscillating ---
         try:
@@ -759,7 +956,7 @@ def run_prefilter(limit=None):
                 n_osc_int = int(float(n_osc))
                 if n_osc_int < MIN_OSCILLATING:
                     reason = f"num_osc={n_osc_int}<{MIN_OSCILLATING}"
-                    print(f"{progress_bar} REJECT {problem_id:<45} ({reason})")
+                    print(format_status('REJECT', problem_id, reason, progress_bar))
                     _reject(idx, problem_id, reason, instance_dir, "rejected_oscillating")
                     continue
         except (ValueError, TypeError):
@@ -770,20 +967,21 @@ def run_prefilter(limit=None):
         avg_ok, avg_val = repo_average_ok(store, repo_id)
         if not avg_ok:
             reason = f"repo_avg={avg_val:.3f}"
-            print(f"{progress_bar} REJECT {problem_id:<45} ({reason})")
+            print(format_status('REJECT', problem_id, reason, progress_bar))
             _reject(idx, problem_id, reason, instance_dir, "rejected_repo_avg")
             continue
 
         # --- Check 2: Standard structural checks ---
         if not instance_dir.exists():
             reason = "instance dir missing"
-            print(f"{progress_bar} REJECT {problem_id:<45} ({reason})")
+            print(format_status('REJECT', problem_id, reason, progress_bar))
             _reject(idx, problem_id, reason, instance_dir, "rejected_structural")
             continue
 
         ok, reason = prefilter_instance(instance_dir)
         if not ok:
-            print(f"{progress_bar} REJECT {problem_id:<45} ({reason[:35]})")
+            reason_short = reason[:40] + "..." if len(reason) > 40 else reason
+            print(format_status('REJECT', problem_id, reason_short, progress_bar))
             _reject(idx, problem_id, reason, instance_dir, "rejected_structural")
             continue
 
@@ -801,24 +999,37 @@ def run_prefilter(limit=None):
             is_dup, dup_details = check_duplicate_criteria(current_rubric, prior)
             if is_dup:
                 reason = "duplicate bug location"
-                print(f"{progress_bar} REJECT {problem_id:<45} ({reason})")
+                print(format_status('REJECT', problem_id, reason, progress_bar))
                 _reject(idx, problem_id, reason + ": " + "; ".join(dup_details), instance_dir, "rejected_duplicate")
                 continue
 
-        print(f"{progress_bar} PASS   {problem_id:<45} (ready for agent QA)")
+        print(format_status('PASS', problem_id, 'ready for agent QA', progress_bar) + f" {eta_str}")
         stats["passed"] += 1
 
     df.to_csv(CSV_PATH, index=False)
 
-    print(f"\n{'='*70}")
-    print(f"Pre-filter Complete")
-    print(f"{'='*70}")
-    print(f"Passed:                {stats['passed']:4d} instances (ready for agent QA)")
-    print(f"Rejected (oscillating):{stats['rejected_oscillating']:4d} instances")
-    print(f"Rejected (repo avg):   {stats['rejected_repo_avg']:4d} instances")
-    print(f"Rejected (structural): {stats['rejected_structural']:4d} instances")
-    print(f"Rejected (duplicate):  {stats['rejected_duplicate']:4d} instances")
-    print(f"{'='*70}")
+    elapsed_total = time.time() - start_time
+    total_checked = sum(stats.values())
+
+    print_header("Pre-filter Complete", 80)
+    print(f"{Colors.BOLD}Results Summary:{Colors.RESET}")
+    print(f"  {Colors.GREEN}Passed:{Colors.RESET}            {stats['passed']:5,} instances  {Colors.DIM}(ready for agent QA){Colors.RESET}")
+    if stats['rejected_oscillating'] + stats['rejected_repo_avg'] + stats['rejected_structural'] + stats['rejected_duplicate'] > 0:
+        print(f"\n{Colors.BOLD}Rejected:{Colors.RESET}")
+        if stats['rejected_oscillating'] > 0:
+            print(f"  {Colors.RED}Oscillating:{Colors.RESET}      {stats['rejected_oscillating']:5,} instances  {Colors.DIM}(< {MIN_OSCILLATING} oscillations){Colors.RESET}")
+        if stats['rejected_repo_avg'] > 0:
+            print(f"  {Colors.RED}Repo average:{Colors.RESET}     {stats['rejected_repo_avg']:5,} instances  {Colors.DIM}(outside [0.4, 0.8]){Colors.RESET}")
+        if stats['rejected_structural'] > 0:
+            print(f"  {Colors.RED}Structural:{Colors.RESET}       {stats['rejected_structural']:5,} instances  {Colors.DIM}(missing/invalid data){Colors.RESET}")
+        if stats['rejected_duplicate'] > 0:
+            print(f"  {Colors.RED}Duplicate:{Colors.RESET}        {stats['rejected_duplicate']:5,} instances  {Colors.DIM}(same bug location){Colors.RESET}")
+    print(f"\n{Colors.BOLD}Performance:{Colors.RESET}")
+    print(f"  Total time:           {Colors.CYAN}{format_duration(elapsed_total)}{Colors.RESET}")
+    if total_checked > 0:
+        print(f"  Avg time per check:   {Colors.CYAN}{elapsed_total/total_checked:.2f}s{Colors.RESET}")
+        print(f"  Throughput:           {Colors.CYAN}{total_checked / elapsed_total * 60:.1f} checks/min{Colors.RESET}")
+    print_footer(80)
 
 
 # ---------------------------------------------------
@@ -853,6 +1064,10 @@ if __name__ == "__main__":
                              "'accept' to store rubric after agent acceptance")
     parser.add_argument("--limit", type=int, default=None,
                         help="Max rows to process")
+    parser.add_argument("--parallel", type=int, default=10,
+                        help="Number of parallel workers for downloads (default: 10)")
+    parser.add_argument("--max-retries", type=int, default=3,
+                        help="Max retry attempts per instance (default: 3)")
     parser.add_argument("--problem-id", type=str, default=None,
                         help="problem_id (required for 'accept' action)")
     parser.add_argument("--job-id", type=str, default=None,
@@ -860,10 +1075,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.action == "download":
-        print(f"Downloading instances (limit={args.limit})")
-        main(limit=args.limit)
+        main(limit=args.limit, parallel=args.parallel, max_retries=args.max_retries)
     elif args.action == "prefilter":
-        print(f"Running pre-filter (limit={args.limit})")
         run_prefilter(limit=args.limit)
     elif args.action == "accept":
         if not args.problem_id or not args.job_id:
