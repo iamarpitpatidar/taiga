@@ -46,7 +46,7 @@ Use this order for a full run. `repo_store.py` is **never run as a script**; it 
 |------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|----------------------|
 | **1. Download** | `python boot.py download [--limit N]`                                                                                                                                                                                                                                          | User or CI | **Yes** — at start, builds `data/repo_store.json` from database (repo averages). Skips rows where per-instance score not in [0.4, 0.8], **num_oscillating** present and < 3, or **repo average** (all instances of that repo) not in [0.4, 0.8]. Downloads rubric + injected repo, clones original; writes `download_status`. |
 | **2. Prefilter** | `python boot.py prefilter [--limit N]`                                                                                                                                                                                                                             | User or CI | **Yes** — (re)builds repo store from database; for each downloaded instance with empty `status`, checks num_oscillating ≥ 3, repo average in [0.4, 0.8], structural checks (metadata, rubric, dirs), and **cross-instance duplicate** (same file+function as an already-accepted instance of same repo). Rejects with `status=done`, `qa_result=rejected`, writes `result.json`. |
-| **3. QA agents** | Run dataset-loader → diff-analyzer → scoring-engine → rubric-validator → instance-evaluator (see Phases below)                                                                                                                                                                 | User / qa-runner / orchestrator | **No** — agents read instance dirs and database only. |
+| **3. QA pipeline** | Run validate_structure.py → diff-analyzer → check_score.py → rubric-validator → instance-evaluator (see Phases below)                                                                                                                                                                 | User / qa-runner / orchestrator | **No** — scripts/agents read instance dirs and database only. |
 | **4. Update database + repo store** | Set `status=done`, `qa_result=accepted` or `rejected`, `qa_notes`, `processed_at` in database. **If accepted**, the instance-evaluator must also update `data/repo_store.json`: add this instance’s rubric to `processed_rubrics` for its repo (see instance-evaluator agent). | Instance-evaluator (or orchestrator) | **Yes when accepted** — instance-evaluator writes the accepted rubric into the store so prefilter/rubric-validator can detect duplicates later. No manual step. |
 
 **Summary:** Repo store is updated **automatically**: (1) repo averages in steps 1 and 2 (download and prefilter); (2) **processed rubrics** when the instance-evaluator marks an instance **accepted** (it must write the rubric to `data/repo_store.json` in the same turn as the database update).
@@ -211,10 +211,10 @@ Phases are organized for maximum parallelization. Independent agents run concurr
 
 ## Phase 1 — Parallel Analysis (run simultaneously)
 
-Launch **all three** of these agents in parallel:
+Launch **all three** of these checks in parallel:
 
 ### 1a. Dataset Loader
-**Agent:** dataset-loader
+**Script:** `scripts/validate_structure.py` (replaces dataset-loader agent)
 
 Responsibilities:
 - Count rubric criteria
@@ -226,6 +226,8 @@ Output (canonical schema):
 - problem_id, average_score, rubric_entry_count, rubric_criteria
 - files_in_injected_repo, directory_size_ratio
 - rubric_valid, rubric_message, parse_errors (if applicable)
+
+**Performance:** ~50-100ms (script) vs ~3-5s (agent)
 
 ### 1b. Diff Analysis
 **Agent:** diff-analyzer
@@ -241,7 +243,7 @@ Output:
 - changed_files, changed_lines_estimate, diff_classification, flags, evasion_risk
 
 ### 1c. Score Validation
-**Agent:** scoring-engine
+**Script:** `scripts/check_score.py` (replaces scoring-engine agent)
 
 Responsibilities:
 - Confirm score within 0.4–0.8
@@ -249,6 +251,8 @@ Responsibilities:
 
 Output:
 - score_classification, score_band, remark
+
+**Performance:** ~10ms (script) vs ~2-3s (agent)
 
 ---
 
