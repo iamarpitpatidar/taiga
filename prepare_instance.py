@@ -4,11 +4,11 @@ Meta 800 — TAIGA Instance Downloader
 
 Downloads and prepares dataset instances from TAIGA for QA evaluation.
 Reads rubrics directly from JSON files (no job metadata API call).
-Downloads injected_repo and clones original_repo for diff analysis.
+Only downloads injected_repo (no git clone of original repo).
 
 Optimizations:
 - Rubric extraction from JSON files (no API call for job metadata)
-- Shallow git clone (--depth 1) for original repo
+- Core 20% analysis: Rubric tells us which files have bugs, no need for git diff
 - Cached JSON data loading
 
 Author: brian.k @ Turing
@@ -158,6 +158,44 @@ def format_status(status, problem_id, details, progress_bar):
 
     return f"{progress_bar} {status_text} {problem_text} {details_text}"
 
+def clear_lines(n):
+    """Clear n lines from terminal."""
+    if n <= 0:
+        return
+    for _ in range(n):
+        sys.stdout.write('\033[F')  # Move cursor up
+        sys.stdout.write('\033[K')  # Clear line
+    sys.stdout.flush()
+
+def print_active_downloads(active_downloads, active_lock):
+    """Print currently active downloads."""
+    with active_lock:
+        if not active_downloads:
+            return 0
+
+        print(f"{Colors.BOLD}{Colors.BLUE}{'='*80}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.BLUE}Active Downloads ({len(active_downloads)} running){Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.BLUE}{'-'*80}{Colors.RESET}")
+
+        lines = 3  # Header lines
+        for problem_id, status_info in list(active_downloads.items())[:10]:  # Show max 10
+            elapsed = time.time() - status_info['start_time']
+            status = status_info.get('status', 'starting')
+            retry = status_info.get('retry', 0)
+            retry_str = f" {Colors.YELLOW}[retry:{retry}]{Colors.RESET}" if retry > 0 else ""
+            print(f"  {Colors.CYAN}\u2022{Colors.RESET} {problem_id:<45s} {Colors.DIM}{status:<30s}{Colors.RESET} {Colors.GRAY}({elapsed:.0f}s){Colors.RESET}{retry_str}")
+            lines += 1
+
+        if len(active_downloads) > 10:
+            print(f"  {Colors.DIM}... and {len(active_downloads) - 10} more{Colors.RESET}")
+            lines += 1
+
+        print(f"{Colors.BOLD}{Colors.BLUE}{'='*80}{Colors.RESET}")
+        lines += 1
+
+        sys.stdout.flush()  # Force flush to ensure immediate display
+        return lines
+
 # ---------------------------------------------------
 # RETRY WRAPPER
 # ---------------------------------------------------
@@ -260,12 +298,18 @@ def download_preloaded_files(problem_version_id, dest_path, progress_callback=No
     downloaded = 0
 
     with open(dest_path, "wb") as f:
+        last_update = 0
         for chunk in r.iter_content(chunk_size=8192):
             if chunk:
                 f.write(chunk)
                 downloaded += len(chunk)
-                if progress_callback and total_size > 0:
+                # Update progress every 256KB to avoid too many callbacks
+                if progress_callback and total_size > 0 and (downloaded - last_update) >= 262144:
                     progress_callback(downloaded, total_size)
+                    last_update = downloaded
+        # Final update
+        if progress_callback and total_size > 0:
+            progress_callback(downloaded, total_size)
 
     return downloaded
 
@@ -369,38 +413,15 @@ def validate_extraction(injected_dir):
     return issues
 
 
-def clone_original_repo(problem_id, dest_dir):
-    """Clone the original (clean) repo from GitHub for diff analysis.
-
-    Args:
-        problem_id: Format is 'owner__repo-NN' (e.g. 'akaihola__darker-02')
-        dest_dir: Path where to clone the repo
-    """
-    # Parse problem_id to extract owner and repo
-    parts = problem_id.rsplit('-', 1)
-    if len(parts) != 2:
-        raise ValueError(f"Invalid problem_id format: {problem_id} (expected 'owner__repo-NN')")
-
-    repo_part = parts[0]
-    owner_repo = repo_part.replace('__', '/')
-    github_url = f"https://github.com/{owner_repo}.git"
-
-    # Clone with depth 1 for speed (we only need latest state, not full history)
-    cmd = ["git", "clone", "--depth", "1", github_url, str(dest_dir)]
-
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        raise Exception(f"Git clone timed out for {github_url}")
-    except subprocess.CalledProcessError as e:
-        raise Exception(f"Git clone failed for {github_url}: {e.stderr}")
+# Git clone removed - we only need injected_repo for core 20% analysis
+# The rubric already tells us which files have bugs, no need for git diff
 
 # ---------------------------------------------------
 # MAIN
 # ---------------------------------------------------
 
 def prepare_one(problem_id, job_id, avg_score, show_details=False, progress_callback=None):
-    """Prepare a single instance: extract rubric from JSON, download injected repo, clone original repo.
+    """Prepare a single instance: extract rubric from JSON, download injected repo.
 
     Args:
         show_details: If True, print verbose step-by-step output. If False, minimal output.
@@ -441,29 +462,23 @@ def prepare_one(problem_id, job_id, avg_score, show_details=False, progress_call
 
     def download_progress(downloaded, total):
         if progress_callback:
-            pct = int(10 + (downloaded / total) * 70)  # 10-80% for download
+            pct = int(10 + (downloaded / total) * 80)  # 10-90% for download
             progress_callback(pct, 100, f"downloading {downloaded/(1024*1024):.1f}/{total/(1024*1024):.1f}MB")
 
     size = download_preloaded_files(problem_version_id, tar_path, progress_callback=download_progress)
 
     # Step 4: Extract injected repo
     if progress_callback:
-        progress_callback(80, 100, "extracting repo")
+        progress_callback(90, 100, "extracting repo")
     injected_repo_dir = instance_dir / "injected_repo"
     extract_injected_repo(tar_path, injected_repo_dir)
     tar_path.unlink()
 
     file_count = sum(1 for _ in injected_repo_dir.rglob("*") if _.is_file())
 
-    # Step 4b: Clone original repo for diff analysis
-    if progress_callback:
-        progress_callback(85, 100, "cloning original repo")
-    original_repo_dir = instance_dir / "original_repo"
-    clone_original_repo(problem_id, original_repo_dir)
-
     # Step 5: Validate extraction integrity
     if progress_callback:
-        progress_callback(90, 100, "validating")
+        progress_callback(95, 100, "validating")
     issues = validate_extraction(injected_repo_dir)
 
     # Validate rubric structure
@@ -533,8 +548,8 @@ def _should_skip_oscillating(row):
     return False, None
 
 
-def process_single_instance(idx, row, df, store, stats_lock, stats, processed_count_lock, processed_count_ref, total, start_time, max_retries=3):
-    """Process a single instance with retry logic."""
+def process_single_instance(idx, row, df, store, stats_lock, stats, processed_count_lock, processed_count_ref, total, start_time, max_retries, active_downloads, active_lock):
+    """Process a single instance with retry logic and live progress tracking."""
     from repo_store import get_repo_id, repo_average_ok
 
     problem_id = row["problem_id"]
@@ -576,19 +591,37 @@ def process_single_instance(idx, row, df, store, stats_lock, stats, processed_co
         df.at[idx, "download_status"] = "downloaded"
         return ('CACHE', problem_id, 'already downloaded', None)
 
+    # Track this download
+    with active_lock:
+        active_downloads[problem_id] = {
+            'start_time': time.time(),
+            'status': 'starting',
+            'retry': 0
+        }
+
     # Try download with retries
     last_error = None
     for attempt in range(max_retries):
         try:
             retry_msg = f"retry:{attempt+1}" if attempt > 0 else ""
 
-            # Progress tracking
-            current_progress = {"status": "starting"}
+            # Update retry count
+            with active_lock:
+                if problem_id in active_downloads:
+                    active_downloads[problem_id]['retry'] = attempt
 
+            # Progress tracking with live updates
             def progress_callback(current, total_size, status):
-                current_progress["status"] = status
+                with active_lock:
+                    if problem_id in active_downloads:
+                        active_downloads[problem_id]['status'] = status
 
             result = prepare_one(problem_id, job_id, avg_score, show_details=False, progress_callback=progress_callback)
+
+            # Remove from active tracking
+            with active_lock:
+                if problem_id in active_downloads:
+                    del active_downloads[problem_id]
 
             with stats_lock:
                 stats["succeeded"] += 1
@@ -604,9 +637,17 @@ def process_single_instance(idx, row, df, store, stats_lock, stats, processed_co
         except Exception as e:
             last_error = str(e)
             if attempt < max_retries - 1:
+                with active_lock:
+                    if problem_id in active_downloads:
+                        active_downloads[problem_id]['status'] = f'retrying (attempt {attempt+2}/{max_retries})'
                 time.sleep(2 ** attempt)  # Exponential backoff
                 continue
             else:
+                # Remove from active tracking
+                with active_lock:
+                    if problem_id in active_downloads:
+                        del active_downloads[problem_id]
+
                 with stats_lock:
                     stats["failed"] += 1
                 error_msg = last_error[:40]
@@ -672,19 +713,32 @@ def main(limit=None, parallel=10, max_retries=3):
     start_time = time.time()
 
     # Active downloads tracking for live status
-    active_downloads = {}
+    active_downloads = {}  # problem_id -> status_info
     active_lock = Lock()
+    last_display_lines = [0]  # Track lines for clearing
+    stop_display = [False]  # Signal to stop display thread
 
     def submit_task(executor, idx, row):
         """Submit a task and track it."""
         future = executor.submit(
             process_single_instance,
             idx, row, df, store, stats_lock, stats,
-            processed_count_lock, processed_count, len(to_process), start_time, max_retries
+            processed_count_lock, processed_count, len(to_process), start_time, max_retries,
+            active_downloads, active_lock
         )
-        with active_lock:
-            active_downloads[future] = (row["problem_id"], time.time())
         return future
+
+    def display_progress():
+        """Background thread to display active downloads."""
+        while not stop_display[0]:
+            if last_display_lines[0] > 0:
+                clear_lines(last_display_lines[0])
+            last_display_lines[0] = print_active_downloads(active_downloads, active_lock)
+            time.sleep(1)  # Update every second
+
+    # Start display thread
+    display_thread = Thread(target=display_progress, daemon=True)
+    display_thread.start()
 
     with ThreadPoolExecutor(max_workers=parallel) as executor:
         # Submit initial batch
@@ -705,11 +759,6 @@ def main(limit=None, parallel=10, max_retries=3):
             with processed_count_lock:
                 processed_count[0] += 1
                 current_count = processed_count[0]
-
-            # Remove from active tracking
-            with active_lock:
-                if future in active_downloads:
-                    del active_downloads[future]
 
             # Get result
             try:
@@ -734,7 +783,11 @@ def main(limit=None, parallel=10, max_retries=3):
             else:
                 eta_str = ""
 
-            # Print result
+            # Clear display and print result
+            if last_display_lines[0] > 0:
+                clear_lines(last_display_lines[0])
+                last_display_lines[0] = 0
+
             line = format_status(status, problem_id, details, progress_bar)
             if status == 'OK':
                 line += f" {eta_str}"
@@ -751,6 +804,12 @@ def main(limit=None, parallel=10, max_retries=3):
                 futures[new_future] = idx
             except StopIteration:
                 pass
+
+    # Stop display thread
+    stop_display[0] = True
+    time.sleep(1.1)  # Wait for last display update
+    if last_display_lines[0] > 0:
+        clear_lines(last_display_lines[0])
 
     elapsed_total = time.time() - start_time
 
