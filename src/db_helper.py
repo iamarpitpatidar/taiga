@@ -152,30 +152,56 @@ def repo_average_ok(repo_id):
     return (0.4 <= avg <= 0.8), avg
 
 
-def get_prior_rubrics(repo_id, exclude_problem_id=None):
-    """Get all accepted rubrics for a repo (excluding specific problem_id)."""
+def get_prior_rubrics(repo_id, exclude_job_id=None, problem_id=None):
+    """Get all accepted rubrics for a repo.
+
+    Args:
+        repo_id: Repository ID
+        exclude_job_id: Exclude this specific job_id (optional)
+        problem_id: Filter by problem_id to get all jobs for same problem (optional)
+
+    Returns:
+        List of dicts with keys: problem_id, job_id, rubric, score
+    """
     with get_db() as conn:
-        if exclude_problem_id:
-            cursor = conn.execute(
-                "SELECT problem_id, rubric_json FROM accepted_rubrics WHERE repo_id = ? AND problem_id != ?",
-                (repo_id, exclude_problem_id)
-            )
-        else:
-            cursor = conn.execute(
-                "SELECT problem_id, rubric_json FROM accepted_rubrics WHERE repo_id = ?",
-                (repo_id,)
-            )
+        query = "SELECT problem_id, job_id, rubric_json, score FROM accepted_rubrics WHERE repo_id = ?"
+        params = [repo_id]
 
+        if problem_id:
+            query += " AND problem_id = ?"
+            params.append(problem_id)
+
+        if exclude_job_id:
+            query += " AND job_id != ?"
+            params.append(exclude_job_id)
+
+        cursor = conn.execute(query, params)
         rows = cursor.fetchall()
-        return {row['problem_id']: json.loads(row['rubric_json']) for row in rows}
+        return [
+            {
+                'problem_id': row['problem_id'],
+                'job_id': row['job_id'],
+                'rubric': json.loads(row['rubric_json']),
+                'score': row['score']
+            }
+            for row in rows
+        ]
 
 
-def add_accepted_rubric(repo_id, problem_id, rubric):
-    """Add an accepted rubric to the store."""
+def add_accepted_rubric(repo_id, problem_id, job_id, rubric, score=None):
+    """Add an accepted rubric to the store.
+
+    Args:
+        repo_id: Repository ID
+        problem_id: Problem ID
+        job_id: Job ID (unique identifier for this acceptance)
+        rubric: Rubric data (will be JSON serialized)
+        score: Score for this instance (optional)
+    """
     with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO accepted_rubrics (repo_id, problem_id, rubric_json) VALUES (?, ?, ?)",
-            (repo_id, problem_id, json.dumps(rubric))
+            "INSERT OR REPLACE INTO accepted_rubrics (repo_id, problem_id, job_id, rubric_json, score) VALUES (?, ?, ?, ?, ?)",
+            (repo_id, problem_id, job_id, json.dumps(rubric), score)
         )
         conn.commit()
 

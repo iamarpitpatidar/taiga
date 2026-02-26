@@ -78,8 +78,8 @@ def check_duplicate_locations(
         Tuple of (has_duplicates: bool, duplicate_details: List[str])
         duplicate_details contains strings describing which prior instances have conflicts
     """
-    # Get all prior accepted rubrics for this repo (excluding current instance)
-    prior_rubrics = get_prior_rubrics(repo_id, exclude_problem_id=current_problem_id)
+    # Get all prior accepted rubrics for this repo
+    prior_rubrics = get_prior_rubrics(repo_id)
 
     if not prior_rubrics:
         return False, []
@@ -99,7 +99,11 @@ def check_duplicate_locations(
 
     # Check against each prior rubric
     duplicate_details = []
-    for prior_problem_id, prior_rubric in prior_rubrics.items():
+    for prior_entry in prior_rubrics:
+        prior_problem_id = prior_entry['problem_id']
+        prior_job_id = prior_entry['job_id']
+        prior_rubric = prior_entry['rubric']
+
         # Extract locations from prior rubric
         prior_locations = []
         for entry in prior_rubric:
@@ -118,20 +122,20 @@ def check_duplicate_locations(
                 if curr_loc["file"] and prior_loc["file"] and curr_loc["file"] == prior_loc["file"]:
                     if curr_loc["function"] and prior_loc["function"] and curr_loc["function"] == prior_loc["function"]:
                         duplicate_details.append(
-                            f"Criterion {curr_loc['index']+1} matches {prior_problem_id}: "
+                            f"Criterion {curr_loc['index']+1} matches {prior_problem_id} (job {prior_job_id[:8]}): "
                             f"{curr_loc['file']}::{curr_loc['function']}"
                         )
                     elif not curr_loc["function"] and not prior_loc["function"]:
                         # Both have file but no function
                         duplicate_details.append(
-                            f"Criterion {curr_loc['index']+1} matches {prior_problem_id}: "
+                            f"Criterion {curr_loc['index']+1} matches {prior_problem_id} (job {prior_job_id[:8]}): "
                             f"{curr_loc['file']} (no function specified)"
                         )
                 # Match on function only (if no file match)
                 elif curr_loc["function"] and prior_loc["function"] and curr_loc["function"] == prior_loc["function"]:
                     if not (curr_loc["file"] and prior_loc["file"]):
                         duplicate_details.append(
-                            f"Criterion {curr_loc['index']+1} matches {prior_problem_id}: "
+                            f"Criterion {curr_loc['index']+1} matches {prior_problem_id} (job {prior_job_id[:8]}): "
                             f"function {curr_loc['function']} (no file path to compare)"
                         )
 
@@ -161,16 +165,18 @@ def compare_quality(score1: float, score2: float) -> int:
     return -1 if dist1 < dist2 else 1
 
 
-def store_accepted_rubric(problem_id: str, rubric: List[Dict]) -> None:
+def store_accepted_rubric(problem_id: str, job_id: str, rubric: List[Dict], score: float = None) -> None:
     """
     Store an accepted rubric in the database for future duplicate checking.
 
     Args:
         problem_id: Instance problem_id (e.g., "owner__repo-07")
+        job_id: Job ID for this instance
         rubric: List of criterion dicts
+        score: Score for this instance (optional)
     """
     repo_id = get_repo_id(problem_id)
-    add_accepted_rubric(repo_id, problem_id, rubric)
+    add_accepted_rubric(repo_id, problem_id, job_id, rubric, score=score)
 
 
 def check_instance_for_duplicates(problem_id: str, rubric_path: str) -> Dict:

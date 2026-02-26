@@ -287,8 +287,14 @@ def extract_location(criterion_text):
 
 
 def check_duplicates(problem_id, rubric):
+    """Check if rubric has duplicate bug locations against all accepted jobs for same repo.
+
+    For the same problem_id, checks against ALL previously accepted jobs (not just one).
+    This ensures if problem has 2 accepted jobs, the 3rd validates against both.
+    """
     repo_id = get_repo_id(problem_id)
-    prior = get_prior_rubrics(repo_id, exclude_problem_id=problem_id)
+    # Get all prior accepted rubrics for this repo
+    prior = get_prior_rubrics(repo_id)
     if not prior:
         return False, []
 
@@ -299,7 +305,11 @@ def check_duplicates(problem_id, rubric):
             current_locs.append({"i": i, "file": fp, "func": fn})
 
     details = []
-    for prior_pid, prior_rubric in prior.items():
+    for prior_entry in prior:
+        prior_pid = prior_entry['problem_id']
+        prior_job_id = prior_entry['job_id']
+        prior_rubric = prior_entry['rubric']
+
         prior_locs = []
         for entry in prior_rubric:
             fp, fn = extract_location(entry.get("criterion", ""))
@@ -311,7 +321,7 @@ def check_duplicates(problem_id, rubric):
                 if cl["file"] and pl["file"] and cl["file"] == pl["file"]:
                     if cl["func"] and pl["func"] and cl["func"] == pl["func"]:
                         details.append(
-                            f"Criterion {cl['i']+1} duplicates {prior_pid}: "
+                            f"Criterion {cl['i']+1} duplicates {prior_pid} (job {prior_job_id[:8]}): "
                             f"{cl['file']}::{cl['func']}"
                         )
 
@@ -460,7 +470,7 @@ def process_instance(row):
     finalize(problem_id, job_id, instance_path, "accepted", qa_notes, result_extra)
 
     # Store accepted rubric for future duplicate checks
-    add_accepted_rubric(repo_id, problem_id, rubric)
+    add_accepted_rubric(repo_id, problem_id, job_id, rubric, score=score_mean)
 
     release_lock(instance_path)
     return "accepted", qa_notes, elapsed

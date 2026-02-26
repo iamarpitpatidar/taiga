@@ -1104,6 +1104,8 @@ def mark_accepted(problem_id: str, job_id: str):
     """After an instance is accepted by agents, store its rubric for future dup checks."""
     instance_dir = INSTANCES_DIR / problem_id / job_id
     rubric_path = instance_dir / "rubric.json"
+    metadata_path = instance_dir / "metadata.json"
+
     if not rubric_path.exists():
         print(f"ERROR: {rubric_path} not found")
         return
@@ -1112,9 +1114,16 @@ def mark_accepted(problem_id: str, job_id: str):
         rubric_data = json.load(f)
     rubric = rubric_data.get("rubric", [])
 
+    # Get score from metadata
+    score = None
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+            score = metadata.get("average_score") or metadata.get("score_mean")
+
     repo_id = db_helper.get_repo_id(problem_id)
-    db_helper.add_accepted_rubric(repo_id, problem_id, rubric)
-    print(f"Stored rubric for {problem_id} ({job_id}) under repo {repo_id}")
+    db_helper.add_accepted_rubric(repo_id, problem_id, job_id, rubric, score=score)
+    print(f"Stored rubric for {problem_id} ({job_id}) under repo {repo_id} with score={score}")
 
 
 if __name__ == "__main__":
