@@ -184,10 +184,10 @@ def build_repo_store():
 
     # Get all instances with scores
     with get_db() as conn:
-        cursor = conn.execute("SELECT problem_id, score_mean, average_score FROM instances")
+        cursor = conn.execute("SELECT problem_id, score_mean FROM instances")
         for row in cursor:
             problem_id = row['problem_id']
-            score = row['score_mean'] or row['average_score']
+            score = row['score_mean']
 
             if score is not None:
                 repo_id = get_repo_id(problem_id)

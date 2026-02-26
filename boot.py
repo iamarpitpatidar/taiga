@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import db_helper
 INSTANCES_DIR = PROJECT_ROOT / "instances"
-DB_PATH = PROJECT_ROOT / "database.sqlite"
+DB_PATH = PROJECT_ROOT / "data/database.sqlite"
 
 MIN_OSCILLATING = 3
 
