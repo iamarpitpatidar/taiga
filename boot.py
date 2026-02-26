@@ -23,12 +23,11 @@ import requests
 import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
-import pandas as pd
 import time
 from datetime import datetime
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from threading import Lock, Thread
 
 # ---------------------------------------------------
@@ -36,8 +35,12 @@ from threading import Lock, Thread
 # ---------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Import from src/
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+import db_helper
 INSTANCES_DIR = PROJECT_ROOT / "instances"
-CSV_PATH = PROJECT_ROOT / "instances.csv"
+DB_PATH = PROJECT_ROOT / "instances.db"
 
 MIN_OSCILLATING = 3
 
@@ -523,10 +526,10 @@ def prepare_one(problem_id, job_id, avg_score, show_details=False, progress_call
 
 
 def _get_score(row):
-    """Return float score from CSV row (score_mean column)."""
+    """Return float score from database row (score_mean column)."""
     for col in ("score_mean", "average_score"):
         v = row.get(col)
-        if v is not None and not (isinstance(v, float) and pd.isna(v)):
+        if v is not None:
             try:
                 return float(v)
             except (TypeError, ValueError):
@@ -548,10 +551,8 @@ def _should_skip_oscillating(row):
     return False, None
 
 
-def process_single_instance(idx, row, df, store, stats_lock, stats, processed_count_lock, processed_count_ref, total, start_time, max_retries, active_downloads, active_lock):
+def process_single_instance(row, stats_lock, stats, processed_count_lock, processed_count_ref, total, start_time, max_retries, active_downloads, active_lock):
     """Process a single instance with retry logic and live progress tracking."""
-    from repo_store import get_repo_id, repo_average_ok
-
     problem_id = row["problem_id"]
     job_id = row["job_id"]
     avg_score = _get_score(row)
@@ -560,35 +561,35 @@ def process_single_instance(idx, row, df, store, stats_lock, stats, processed_co
     if avg_score is None:
         with stats_lock:
             stats["skipped_no_score"] += 1
-        df.at[idx, "download_status"] = "skipped_no_score"
+        db_helper.update_download_status(problem_id, "skipped_no_score")
         return ('SKIP', problem_id, 'no score', None)
 
     if not (0.4 <= avg_score <= 0.8):
         with stats_lock:
             stats["skipped_score"] += 1
-        df.at[idx, "download_status"] = "skipped_score"
+        db_helper.update_download_status(problem_id, "skipped_score")
         return ('SKIP', problem_id, f'score={avg_score:.3f}', None)
 
     skip_osc, reason_osc = _should_skip_oscillating(row)
     if skip_osc:
         with stats_lock:
             stats["skipped_oscillating"] += 1
-        df.at[idx, "download_status"] = "skipped_oscillating"
+        db_helper.update_download_status(problem_id, "skipped_oscillating")
         return ('SKIP', problem_id, reason_osc, None)
 
-    repo_id = get_repo_id(problem_id)
-    avg_ok, avg_val = repo_average_ok(store, repo_id)
+    repo_id = db_helper.get_repo_id(problem_id)
+    avg_ok, avg_val = db_helper.repo_average_ok(repo_id)
     if not avg_ok:
         with stats_lock:
             stats["skipped_repo_average"] += 1
-        df.at[idx, "download_status"] = "skipped_repo_average"
+        db_helper.update_download_status(problem_id, "skipped_repo_average")
         return ('SKIP', problem_id, f'repo_avg={avg_val:.3f}', None)
 
     instance_dir = INSTANCES_DIR / problem_id / job_id
     if instance_dir.exists() and (instance_dir / "metadata.json").exists():
         with stats_lock:
             stats["already_downloaded"] += 1
-        df.at[idx, "download_status"] = "downloaded"
+        db_helper.update_download_status(problem_id, "downloaded")
         return ('CACHE', problem_id, 'already downloaded', None)
 
     # Track this download
@@ -628,7 +629,7 @@ def process_single_instance(idx, row, df, store, stats_lock, stats, processed_co
                 stats["total_size_mb"] += result["size_mb"]
                 stats["total_files"] += result["file_count"]
 
-            df.at[idx, "download_status"] = "downloaded"
+            db_helper.update_download_status(problem_id, "downloaded")
             details = f"{format_size(result['size_mb'] * 1024 * 1024)}, {result['file_count']:,} files"
             if retry_msg:
                 details = f"{details} {retry_msg}"
@@ -651,11 +652,11 @@ def process_single_instance(idx, row, df, store, stats_lock, stats, processed_co
                 with stats_lock:
                     stats["failed"] += 1
                 error_msg = last_error[:40]
-                df.at[idx, "download_status"] = f"error: {last_error[:100]}"
+                db_helper.update_download_status(problem_id, f"error: {last_error[:100]}")
                 return ('FAIL', problem_id, f"{error_msg} (retry:{max_retries})", None)
 
 def main(limit=None, parallel=10, max_retries=3):
-    """Read CSV, process rows in parallel with retry logic.
+    """Process instances from database in parallel with retry logic.
     Applies same score/num_oscillating/repo-average filters as prefilter so we
     only download instances that can pass prefilter.
 
@@ -664,32 +665,20 @@ def main(limit=None, parallel=10, max_retries=3):
         parallel: Number of parallel workers (default 10)
         max_retries: Max retry attempts per instance (default 3)
     """
-    from repo_store import build_store_from_csv, get_repo_id, repo_average_ok
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"Database not found: {DB_PATH}\nRun: python migrate_to_sqlite.py")
 
-    if not CSV_PATH.exists():
-        raise FileNotFoundError("instances_output.csv not found.")
+    # Build repo store from database
+    db_helper.build_repo_store()
 
-    df = pd.read_csv(CSV_PATH)
-
-    if "download_status" not in df.columns:
-        df["download_status"] = ""
-
-    # Ensure download_status column is string type to avoid dtype warnings
-    df["download_status"] = df["download_status"].astype(str).replace('nan', '')
-
-    # Build repo store once so we can filter by repo average
-    store = build_store_from_csv(CSV_PATH)
-
-    total = len(df)
-    to_process = df[df["download_status"] != "downloaded"]
-
-    if limit:
-        to_process = to_process.head(limit)
+    total = db_helper.get_instance_count()
+    to_process = db_helper.get_instances_to_process(limit=limit)
+    already_downloaded = db_helper.get_downloaded_count()
 
     print_header("TAIGA Instance Downloader (Parallel Mode)", 80)
     print(f"{Colors.BOLD}Dataset Overview:{Colors.RESET}")
-    print(f"  Total instances in CSV:  {Colors.CYAN}{total:,}{Colors.RESET}")
-    print(f"  Already downloaded:      {Colors.GREEN}{total - len(to_process):,}{Colors.RESET}")
+    print(f"  Total instances:         {Colors.CYAN}{total:,}{Colors.RESET}")
+    print(f"  Already downloaded:      {Colors.GREEN}{already_downloaded:,}{Colors.RESET}")
     print(f"  To process:              {Colors.YELLOW}{len(to_process):,}{Colors.RESET}{f' {Colors.DIM}(limit={limit}){Colors.RESET}' if limit else ''}")
     print(f"  Parallel workers:        {Colors.CYAN}{parallel}{Colors.RESET}")
     print(f"  Max retries:             {Colors.CYAN}{max_retries}{Colors.RESET}")
@@ -718,11 +707,11 @@ def main(limit=None, parallel=10, max_retries=3):
     last_display_lines = [0]  # Track lines for clearing
     stop_display = [False]  # Signal to stop display thread
 
-    def submit_task(executor, idx, row):
+    def submit_task(executor, row):
         """Submit a task and track it."""
         future = executor.submit(
             process_single_instance,
-            idx, row, df, store, stats_lock, stats,
+            row, stats_lock, stats,
             processed_count_lock, processed_count, len(to_process), start_time, max_retries,
             active_downloads, active_lock
         )
@@ -757,7 +746,7 @@ def main(limit=None, parallel=10, max_retries=3):
     with ThreadPoolExecutor(max_workers=parallel) as executor:
         # Submit initial batch
         futures = {}
-        indices_iter = iter(to_process.index)
+        instances_iter = iter(to_process)
 
         # Keep submitting tasks to maintain full pool
         def submit_more_tasks(count):
@@ -765,10 +754,9 @@ def main(limit=None, parallel=10, max_retries=3):
             submitted = 0
             for _ in range(count):
                 try:
-                    idx = next(indices_iter)
-                    row = df.loc[idx]
-                    future = submit_task(executor, idx, row)
-                    futures[future] = idx
+                    row = next(instances_iter)
+                    future = submit_task(executor, row)
+                    futures[future] = row['problem_id']
                     submitted += 1
                 except StopIteration:
                     break
@@ -822,9 +810,6 @@ def main(limit=None, parallel=10, max_retries=3):
                 if status == 'OK':
                     line += f" {eta_str}"
                 print(line, flush=True)
-
-                # Save CSV after each completion
-                df.to_csv(CSV_PATH, index=False)
 
             # After processing completed futures, submit more to keep pool full
             slots_available = parallel - len(futures)
@@ -935,39 +920,38 @@ def run_prefilter(limit=None):
       4. Cross-instance rubric duplication (same file+function location)
     """
     from datetime import datetime, timezone
-    from repo_store import (
-        build_store_from_csv,
-        repo_average_ok,
-        get_repo_id,
-        get_prior_rubrics,
-        check_duplicate_criteria,
-        add_accepted_rubric,
-    )
 
-    if not CSV_PATH.exists():
-        raise FileNotFoundError("CSV not found.")
+    # Check duplicate criteria helper
+    def check_duplicate_criteria(current_rubric, prior_rubrics):
+        """Check if rubric criteria duplicate any prior accepted rubrics."""
+        duplicates = []
+        for entry in current_rubric:
+            file_path = entry.get('criterion', {}).get('file_path', '')
+            func_name = entry.get('criterion', {}).get('function_name', '')
+            if not file_path:
+                continue
 
-    df = pd.read_csv(CSV_PATH, dtype={"status": str, "qa_result": str, "qa_notes": str, "processed_at": str, "download_status": str})
+            for prior_pid, prior_rubric in prior_rubrics.items():
+                for prior_entry in prior_rubric:
+                    prior_file = prior_entry.get('criterion', {}).get('file_path', '')
+                    prior_func = prior_entry.get('criterion', {}).get('function_name', '')
+                    if file_path == prior_file and func_name == prior_func:
+                        duplicates.append(f"{file_path}:{func_name} (matches {prior_pid})")
 
-    for col in ["status", "qa_result", "qa_notes", "processed_at", "download_status"]:
-        if col not in df.columns:
-            df[col] = ""
-        df[col] = df[col].fillna("").astype(str)
+        return (len(duplicates) > 0, duplicates)
 
-    # Build repo store with averages from full CSV (once at start)
-    store = build_store_from_csv(CSV_PATH)
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"Database not found: {DB_PATH}\nRun: python migrate_to_sqlite.py")
 
-    candidates = df[
-        (df["download_status"] == "downloaded") &
-        ((df["status"] == "") | (df["status"].isna()))
-    ]
+    # Build repo store from database
+    db_helper.build_repo_store()
 
-    if limit:
-        candidates = candidates.head(limit)
+    # Get candidates
+    candidates = db_helper.get_instances_for_prefilter(limit=limit)
 
     print_header("Pre-filter: Deterministic Quality Checks", 80)
     print(f"{Colors.BOLD}Configuration:{Colors.RESET}")
-    print(f"  Repo store loaded:   {Colors.GREEN}data/repo_store.json{Colors.RESET}")
+    print(f"  Repo store loaded:   {Colors.GREEN}data/repo_store.db{Colors.RESET}")
     print(f"  Candidates to check: {Colors.CYAN}{len(candidates):,}{Colors.RESET}")
     if limit:
         print(f"  Limit applied:       {Colors.YELLOW}{limit:,}{Colors.RESET}")
@@ -989,13 +973,10 @@ def run_prefilter(limit=None):
     processed_count = 0
     start_time = time.time()
 
-    def _reject(idx, problem_id, reason, instance_dir, category):
+    def _reject(problem_id, reason, instance_dir, category):
         stats[category] += 1
         now = datetime.now(timezone.utc).isoformat()
-        df.at[idx, "status"] = "done"
-        df.at[idx, "qa_result"] = "rejected"
-        df.at[idx, "qa_notes"] = f"Pre-filter reject: {reason}"
-        df.at[idx, "processed_at"] = now
+        db_helper.update_qa_status(problem_id, "rejected", f"Pre-filter reject: {reason}", now)
 
         result = {
             "problem_id": problem_id,
@@ -1014,9 +995,8 @@ def run_prefilter(limit=None):
             with open(instance_dir / "result.json", "w") as f:
                 json.dump(result, f, indent=2)
 
-    for idx in candidates.index:
+    for row in candidates:
         processed_count += 1
-        row = df.loc[idx]
         problem_id = row["problem_id"]
         job_id = row["job_id"]
         instance_dir = INSTANCES_DIR / problem_id / job_id
@@ -1042,32 +1022,32 @@ def run_prefilter(limit=None):
                 if n_osc_int < MIN_OSCILLATING:
                     reason = f"num_osc={n_osc_int}<{MIN_OSCILLATING}"
                     print(format_status('REJECT', problem_id, reason, progress_bar))
-                    _reject(idx, problem_id, reason, instance_dir, "rejected_oscillating")
+                    _reject(problem_id, reason, instance_dir, "rejected_oscillating")
                     continue
         except (ValueError, TypeError):
             pass
 
         # --- Check 1: Repo average in [0.4, 0.8] ---
-        repo_id = get_repo_id(problem_id)
-        avg_ok, avg_val = repo_average_ok(store, repo_id)
+        repo_id = db_helper.get_repo_id(problem_id)
+        avg_ok, avg_val = db_helper.repo_average_ok(repo_id)
         if not avg_ok:
             reason = f"repo_avg={avg_val:.3f}"
             print(format_status('REJECT', problem_id, reason, progress_bar))
-            _reject(idx, problem_id, reason, instance_dir, "rejected_repo_avg")
+            _reject(problem_id, reason, instance_dir, "rejected_repo_avg")
             continue
 
         # --- Check 2: Standard structural checks ---
         if not instance_dir.exists():
             reason = "instance dir missing"
             print(format_status('REJECT', problem_id, reason, progress_bar))
-            _reject(idx, problem_id, reason, instance_dir, "rejected_structural")
+            _reject(problem_id, reason, instance_dir, "rejected_structural")
             continue
 
         ok, reason = prefilter_instance(instance_dir)
         if not ok:
             reason_short = reason[:40] + "..." if len(reason) > 40 else reason
             print(format_status('REJECT', problem_id, reason_short, progress_bar))
-            _reject(idx, problem_id, reason, instance_dir, "rejected_structural")
+            _reject(problem_id, reason, instance_dir, "rejected_structural")
             continue
 
         # --- Check 3: Cross-instance rubric duplication ---
@@ -1080,18 +1060,16 @@ def run_prefilter(limit=None):
             current_rubric = []
 
         if current_rubric:
-            prior = get_prior_rubrics(store, repo_id, exclude_problem_id=problem_id)
+            prior = db_helper.get_prior_rubrics(repo_id, exclude_problem_id=problem_id)
             is_dup, dup_details = check_duplicate_criteria(current_rubric, prior)
             if is_dup:
                 reason = "duplicate bug location"
                 print(format_status('REJECT', problem_id, reason, progress_bar))
-                _reject(idx, problem_id, reason + ": " + "; ".join(dup_details), instance_dir, "rejected_duplicate")
+                _reject(problem_id, reason + ": " + "; ".join(dup_details), instance_dir, "rejected_duplicate")
                 continue
 
         print(format_status('PASS', problem_id, 'ready for agent QA', progress_bar) + f" {eta_str}")
         stats["passed"] += 1
-
-    df.to_csv(CSV_PATH, index=False)
 
     elapsed_total = time.time() - start_time
     total_checked = sum(stats.values())
@@ -1121,8 +1099,6 @@ def run_prefilter(limit=None):
 
 def mark_accepted(problem_id: str, job_id: str):
     """After an instance is accepted by agents, store its rubric for future dup checks."""
-    from repo_store import get_repo_id, load_store, add_accepted_rubric
-
     instance_dir = INSTANCES_DIR / problem_id / job_id
     rubric_path = instance_dir / "rubric.json"
     if not rubric_path.exists():
@@ -1133,9 +1109,8 @@ def mark_accepted(problem_id: str, job_id: str):
         rubric_data = json.load(f)
     rubric = rubric_data.get("rubric", [])
 
-    store = load_store()
-    repo_id = get_repo_id(problem_id)
-    add_accepted_rubric(store, repo_id, problem_id, rubric)
+    repo_id = db_helper.get_repo_id(problem_id)
+    db_helper.add_accepted_rubric(repo_id, problem_id, rubric)
     print(f"Stored rubric for {problem_id} ({job_id}) under repo {repo_id}")
 
 
