@@ -9,32 +9,36 @@ This command is the single source of truth for evaluating a prepared TAIGA insta
 ## Command Format
 
 ```bash
-/qa-runner <problem_id>
+/qa-runner <job_id>
 ```
 
 ### Example
 ```bash
-/qa-runner simdutf__simdutf-07
+/qa-runner 483570b9-b936-47bc-8e26-107a70bd808f
 ```
+
+**Note:** The qa-runner works on `job_id` (the UUID for a specific TAIGA run), NOT `problem_id`. The instance directory structure is `instances/<problem_id>/<job_id>/`.
 
 ---
 
 # Working Directory
 
-**Project Root**  
+**Project Root**
 `MetaCursorAgent/`
 
-**Instance Directory**  
-`instances/<problem_id>/`
+**Instance Directory**
+`instances/<problem_id>/<job_id>/`
 
 **Injected Repository**
-`<instance_dir>/injected_repo/`
+`instances/<problem_id>/<job_id>/injected_repo/`
 
 **Database**
 `instances` table in the project database
 
-**Repo store (automatic):**
-`data/repo_store.json` — built and used by `prepare_instance.py`; do not edit by hand.
+**Repo Store (database):**
+- `repositories` table — repo-level averages (built automatically from instances)
+- `rubrics` table — processed rubrics for duplicate checking
+- Managed by `src/db_helper.py` and `.claude/scripts/check_rubric_duplicates.py`
 
 ---
 
@@ -44,12 +48,12 @@ Use this order for a full run. `repo_store.py` is **never run as a script**; it 
 
 | Step | Command / Action                                                                                                                                                                                                                                                               | Who invokes | What uses repo_store |
 |------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|----------------------|
-| **1. Download** | `python boot.py download [--limit N]`                                                                                                                                                                                                                                          | User or CI | **Yes** — at start, builds `data/repo_store.json` from database (repo averages). Skips rows where per-instance score not in [0.4, 0.8], **num_oscillating** present and < 3, or **repo average** (all instances of that repo) not in [0.4, 0.8]. Downloads rubric + injected repo, clones original; writes `download_status`. |
+| **1. Download** | `python boot.py download [--limit N]`                                                                                                                                                                                                                                          | User or CI | **Yes** — at start, builds repo averages in database (`repositories` table). Skips rows where per-instance score not in [0.4, 0.8], **num_oscillating** present and < 3, or **repo average** (all instances of that repo) not in [0.4, 0.8]. Downloads rubric + injected repo, clones original; writes `download_status`. |
 | **2. Prefilter** | `python boot.py prefilter [--limit N]`                                                                                                                                                                                                                             | User or CI | **Yes** — (re)builds repo store from database; for each downloaded instance with empty `status`, checks num_oscillating ≥ 3, repo average in [0.4, 0.8], structural checks (metadata, rubric, dirs), and **cross-instance duplicate** (same file+function as an already-accepted instance of same repo). Rejects with `status=done`, `qa_result=rejected`, writes `result.json`. |
 | **3. QA pipeline** | Run validate_structure.py → diff-analyzer → check_score.py → rubric-validator → instance-evaluator (see Phases below)                                                                                                                                                                 | User / qa-runner / orchestrator | **No** — scripts/agents read instance dirs and database only. |
-| **4. Update database + repo store** | Set `status=done`, `qa_result=accepted` or `rejected`, `qa_notes`, `processed_at` in database. **If accepted**, the instance-evaluator must also update `data/repo_store.json`: add this instance’s rubric to `processed_rubrics` for its repo (see instance-evaluator agent). | Instance-evaluator (or orchestrator) | **Yes when accepted** — instance-evaluator writes the accepted rubric into the store so prefilter/rubric-validator can detect duplicates later. No manual step. |
+| **4. Update database + repo store** | Set `status=done`, `qa_result=accepted` or `rejected`, `qa_notes`, `processed_at` in database. **If accepted**, must also call `db_helper.add_accepted_rubric()` to store the rubric in `rubrics` table for future duplicate checking. | Instance-evaluator (or orchestrator) | **Yes when accepted** — rubric is stored in database so prefilter/rubric-validator can detect duplicates later. No manual step. |
 
-**Summary:** Repo store is updated **automatically**: (1) repo averages in steps 1 and 2 (download and prefilter); (2) **processed rubrics** when the instance-evaluator marks an instance **accepted** (it must write the rubric to `data/repo_store.json` in the same turn as the database update).
+**Summary:** Repo store is updated **automatically** in the database: (1) repo averages in steps 1 and 2 (download and prefilter) via `db_helper.build_repo_store()`; (2) **processed rubrics** when the instance-evaluator marks an instance **accepted** via `db_helper.add_accepted_rubric()`.
 
 ---
 
@@ -57,20 +61,22 @@ Use this order for a full run. `repo_store.py` is **never run as a script**; it 
 
 Before beginning evaluation, verify:
 
-1. `instances/<problem_id>/` exists.
+1. `instances/<problem_id>/<job_id>/` exists.
 2. The following files exist:
    - `injected_repo/`
    - `rubric.json`
    - `metadata.json`
-3. Database contains exactly one row matching `problem_id`.
+3. Database contains exactly one row matching `job_id`.
 4. Row `status` is NOT `"done"`.
 5. No `QA_LOCK` file exists inside instance directory.
 6. `metadata.json` contains:
-   - `problem_id`
-   - `job_id`
+   - `problem_id` (e.g., `simdutf__simdutf-07`)
+   - `job_id` (UUID, e.g., `483570b9-b936-47bc-8e26-107a70bd808f`)
    - `average_score` (or `score_mean` from database)
 
 If any check fails → **abort immediately**.
+
+**Important:** The `job_id` is the primary key for processing. Multiple jobs can exist for the same `problem_id`.
 
 ---
 
@@ -78,10 +84,12 @@ If any check fails → **abort immediately**.
 
 **Source of truth:** `instances` table in the project database. All columns below must be present.
 
+**Primary Key:** `job_id` (UUID) — qa-runner operates on job_id, NOT problem_id
+
 | Column                | Description |
 |-----------------------|-------------|
-| job_id                | TAIGA job identifier (UUID) |
-| problem_id            | Instance ID: `owner__repo-NN` (e.g. `simdutf__simdutf-07`) |
+| job_id                | **PRIMARY KEY** — TAIGA job identifier (UUID, e.g. `483570b9-b936-47bc-8e26-107a70bd808f`) |
+| problem_id            | Instance ID: `owner__repo-NN` (e.g. `simdutf__simdutf-07`). Multiple jobs can share the same problem_id. |
 | num_attempts          | Integer — number of TAIGA attempts |
 | score_mean            | Float — average detection score; must be in **[0.4, 0.8]** for inclusion |
 | score_max             | Float — max score across attempts |
@@ -105,8 +113,8 @@ If any check fails → **abort immediately**.
 
 Before processing:
 
-1. Create `instances/<problem_id>/QA_LOCK`.
-2. Query database for current record.
+1. Create `instances/<problem_id>/<job_id>/QA_LOCK`.
+2. Query database for current record by `job_id`.
 3. Confirm `status` is empty.
 4. Set `status = in_progress`.
 5. Update database.
@@ -117,7 +125,7 @@ If verification fails → abort and remove lock.
 After processing:
 
 - Remove `QA_LOCK`.
-- Update database atomically.
+- Update database atomically by `job_id`.
 
 ---
 
@@ -214,7 +222,7 @@ Phases are organized for maximum parallelization. Independent agents run concurr
 Launch **all three** of these checks in parallel:
 
 ### 1a. Dataset Loader
-**Script:** `scripts/validate_structure.py` (replaces dataset-loader agent)
+**Script:** `.claude/scripts/validate_structure.py` (replaces dataset-loader agent)
 
 Responsibilities:
 - Count rubric criteria
@@ -243,7 +251,7 @@ Output:
 - changed_files, changed_lines_estimate, diff_classification, flags, evasion_risk
 
 ### 1c. Score Validation
-**Script:** `scripts/check_score.py` (replaces scoring-engine agent)
+**Script:** `.claude/scripts/check_score.py` (replaces scoring-engine agent)
 
 Responsibilities:
 - Confirm score within 0.4–0.8
@@ -345,10 +353,10 @@ The pipeline supports automatic sequential processing of all pending instances.
 ## Invocation
 
 ```bash
-/qa-runner                              # Process ALL pending instances
-/qa-runner --limit 10                   # Process next 10 pending instances
-/qa-runner --offset 55 --limit 55       # Process rows 55-109 (for parallel workers)
-/qa-runner simdutf__simdutf-07          # Process single instance
+/qa-runner                                                # Process ALL pending instances
+/qa-runner --limit 10                                     # Process next 10 pending instances
+/qa-runner --offset 55 --limit 55                         # Process rows 55-109 (for parallel workers)
+/qa-runner 483570b9-b936-47bc-8e26-107a70bd808f           # Process single instance by job_id
 ```
 
 ## Parallel Worker Distribution
@@ -380,17 +388,17 @@ OUTER LOOP (continuous polling):
      - GOTO step 1 (reload database and check again)
 
   5. FOR EACH pending row (in order):
-     a. Read problem_id and job_id from row
+     a. Read problem_id and job_id from row (job_id is PRIMARY KEY for processing)
      b. Check instance directory exists (instances/<problem_id>/<job_id>/)
-        - If missing → mark as rejected ("instance directory not found"), continue
-     c. Set status = "in_progress", update database
-     d. Create QA_LOCK
+        - If missing → mark as rejected by job_id ("instance directory not found"), continue
+     c. Set status = "in_progress" for this job_id, update database
+     d. Create QA_LOCK at instances/<problem_id>/<job_id>/QA_LOCK
      e. Run full QA pipeline (Phase 1 → Early Termination check → Phase 2 → Phase 3)
-     f. Update database with verdict
-     g. Write result.json
+     f. Update database with verdict (by job_id)
+     g. Write result.json to instances/<problem_id>/<job_id>/result.json
      h. Remove QA_LOCK
      i. **Cleanup processed instance:** Run `.claude/scripts/cleanup_instance.sh <problem_id> <job_id>`
-     j. Print progress: "[N processed] problem_id → verdict (Xs)"
+     j. Print progress: "[N processed] <problem_id> (job: <job_id>) → verdict (Xs)"
      k. **Query database and check for new downloads** (GOTO step 1)
 
   6. After processing all available rows:
@@ -407,8 +415,8 @@ EXIT CONDITIONS:
 After each instance, print:
 
 ```
-[Processed: 3] zarr-developers__zarr-python-07 → REJECTED (early termination: 47s)
-[Processed: 4] scipy__scipy-12 → ACCEPTED (full pipeline: 92s)
+[Processed: 3] zarr-developers__zarr-python-07 (job: a1b2c3d4-...) → REJECTED (early termination: 47s)
+[Processed: 4] scipy__scipy-12 (job: e5f6g7h8-...) → ACCEPTED (full pipeline: 92s)
 ```
 
 Print summary every 10 instances:
@@ -421,8 +429,8 @@ Waiting for more downloads...
 ## Error Recovery
 
 If an instance fails unexpectedly:
-1. Mark as `rejected` with `qa_notes = "error: <message>"`
-2. Remove QA_LOCK
+1. Mark as `rejected` (by job_id) with `qa_notes = "error: <message>"`
+2. Remove QA_LOCK at instances/<problem_id>/<job_id>/QA_LOCK
 3. **Continue to next instance** (do not halt the batch)
 
 ## Stop Conditions
@@ -454,16 +462,16 @@ Each run must:
 
 After completion:
 
-- `status = done`
+- `status = done` (updated by job_id)
 - `qa_result` set
 - `qa_notes` concise and clear
 - `processed_at` ISO timestamp
 - Lock removed
-- `instances/<problem_id>/result.json` written (full evaluation log)
+- `instances/<problem_id>/<job_id>/result.json` written (full evaluation log)
 
 The `result.json` file persists in the instance directory and contains the complete evaluation record: verdict, confidence, reason codes, score details, diff summary, rubric status, and timestamp. This serves as an audit log and enables re-evaluation without re-running agents.
 
-When the instance-evaluator marks an instance **accepted**, it must also update `data/repo_store.json` (add this instance’s rubric to `processed_rubrics` for its repo) so future instances can be duplicate-checked—no separate manual step.
+When the instance-evaluator marks an instance **accepted**, it must also call `db_helper.add_accepted_rubric()` to store the rubric in the database (keyed by problem_id for duplicate checking across jobs of the same problem).
 
 Instance is now finalized for Meta 800 selection pipeline.
 

@@ -87,7 +87,7 @@ Return verdict and reasoning. **The verdict must always result in a database upd
 
 After evaluation, write a `result.json` to the instance directory:
 
-**Path:** `instances/<problem_id>/result.json`
+**Path:** `instances/<problem_id>/<job_id>/result.json`
 
 ```json
 {
@@ -126,7 +126,7 @@ The verdict (`ACCEPTED` or `REJECTED`) must be persisted to the database. Whoeve
 
 **Table:** `instances`
 
-**Find** the row where `problem_id` matches.
+**Find** the row where `job_id` matches (job_id is the primary key, NOT problem_id).
 
 **Set:**
 - `status` = `"done"`
@@ -140,18 +140,29 @@ The verdict (`ACCEPTED` or `REJECTED`) must be persisted to the database. Whoeve
 
 ## Repo Store Update (Mandatory when ACCEPTED)
 
-When the verdict is **ACCEPTED**, you **must** update the repo store so future instances of the same repo can be checked for duplicate bug locations. Do this in the same turn as the database update.
+When the verdict is **ACCEPTED**, you **must** update the repo store in the database so future instances of the same repo can be checked for duplicate bug locations. Do this in the same turn as the database update.
 
 **Steps:**
 
-1. **Read** `data/repo_store.json` (project root). If the file does not exist, create an empty object `{}`.
-2. **Read** `instances/<problem_id>/rubric.json` and get the top-level array `rubric` (list of 8 criterion objects with `criterion` and `weight`).
-3. **Derive repo_id** from `problem_id`: strip the trailing `-NN` (digits). Example: `bvanelli__actualpy-07` → `bvanelli__actualpy`; `simdutf__simdutf-07` → `simdutf__simdutf`.
-4. **Update the store:**
-   - If `repo_id` is not in the store, add `store[repo_id] = { "processed_rubrics": {} }` (preserve `repo_average` if it already exists for this key).
-   - Set `store[repo_id]["processed_rubrics"][problem_id] = rubric` (the array from step 2).
-5. **Write** `data/repo_store.json` back with the updated content. Preserve all other repos and keys; only add or update this repo’s `processed_rubrics` entry for this `problem_id`.
+1. **Read** `instances/<problem_id>/<job_id>/rubric.json` and get the top-level array `rubric` (list of 8 criterion objects with `criterion` and `weight`).
+2. **Derive repo_id** from `problem_id`: strip the trailing `-NN` (digits). Example: `bvanelli__actualpy-07` → `bvanelli__actualpy`; `simdutf__simdutf-07` → `simdutf__simdutf`.
+3. **Call database helper:**
+   ```python
+   from src.db_helper import add_accepted_rubric, get_repo_id
 
-If the verdict is **REJECTED**, do **not** modify the repo store.
+   repo_id = get_repo_id(problem_id)
+   # Store by problem_id (not job_id) so all jobs of same problem share rubric check
+   add_accepted_rubric(repo_id, problem_id, rubric)
+   ```
+   This stores the rubric in the `rubrics` table.
+
+4. **Alternative:** Use the script helper:
+   ```bash
+   python .claude/scripts/check_rubric_duplicates.py <problem_id> instances/<problem_id>/<job_id>/rubric.json
+   ```
+
+**Important:** Rubrics are stored by `problem_id` (for cross-job duplicate detection), but database updates use `job_id` as the primary key.
+
+If the verdict is **REJECTED**, do **not** update the repo store.
 
 This ensures the prefilter and rubric-validator can detect cross-instance duplicates on later runs without any manual step.

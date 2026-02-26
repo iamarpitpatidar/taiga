@@ -11,7 +11,7 @@ The rubric-validator ensures the rubric is well-formed and that its criteria are
 
 ## Input
 
-**File:** `instances/<problem_id>/rubric.json` or `qa_results/<problem_id>/rubric.json`
+**File:** `instances/<problem_id>/<job_id>/rubric.json`
 
 ---
 
@@ -75,17 +75,27 @@ Flag as invalid if:
 
 ---
 
-## Cross-Instance Duplicate Check (via Repo Store)
+## Cross-Instance Duplicate Check (via Database)
 
 After structural and content checks pass, check for **cross-instance bug duplication** against already-accepted instances of the same repo.
 
 **How:**
 1. Derive `repo_id` from `problem_id` (strip trailing `-NN`).
-2. Read `data/repo_store.json` in the project root.
-3. Look up `processed_rubrics` for this `repo_id` — these are rubrics of previously-accepted instances (excluding current `problem_id` to avoid self-comparison).
-4. For each criterion in the **current** rubric, extract (file path, function/symbol) from the text using regex patterns.
-5. For each criterion in **prior** rubrics, extract the same.
-6. If any current criterion matches a prior one on **(file path, function/symbol)** → flag as `cross_instance_duplicate`.
+2. Query database for prior accepted rubrics:
+   ```python
+   from src.db_helper import get_prior_rubrics, get_repo_id
+
+   repo_id = get_repo_id(problem_id)
+   prior_rubrics = get_prior_rubrics(repo_id, exclude_problem_id=problem_id)
+   ```
+3. For each criterion in the **current** rubric, extract (file path, function/symbol) from the text using regex patterns.
+4. For each criterion in **prior** rubrics, extract the same.
+5. If any current criterion matches a prior one on **(file path, function/symbol)** → flag as `cross_instance_duplicate`.
+
+**Alternative:** Use the helper script:
+```bash
+python .claude/scripts/check_rubric_duplicates.py <problem_id> instances/<problem_id>/<job_id>/rubric.json
+```
 
 **Matching rules:**
 - Match is by **location only** (same file + same function). Wording can differ.
@@ -133,7 +143,7 @@ Stop validation and return `rubric_valid: false` immediately if any:
 | Any entry has `weight != 1` | Non-standard weighting |
 | Any entry missing `criterion` field | Empty criterion |
 | Any criterion references a file path that does not exist in `injected_repo/` | Bug not in specified path |
-| Any criterion shares (file, function) with an already-accepted instance of the same repo | Cross-instance duplicate bug (from `data/repo_store.json`) |
+| Any criterion shares (file, function) with an already-accepted instance of the same repo | Cross-instance duplicate bug (from `rubrics` table) |
 
 These are hard failures — no further content/mapping checks needed.
 

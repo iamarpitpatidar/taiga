@@ -11,7 +11,7 @@ The diff-analyzer compares the original (clean) repo with the injected (buggy) r
 
 ## Input Paths
 
-- **Injected:** `instances/<problem_id>/injected_repo/` or `qa_results/<problem_id>/injected_repo/`
+- **Injected:** `instances/<problem_id>/<job_id>/injected_repo/`
 
 ---
 
