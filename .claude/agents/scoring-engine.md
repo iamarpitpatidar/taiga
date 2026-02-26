@@ -11,7 +11,7 @@ The scoring-engine determines whether the TAIGA average detection score is withi
 
 ## Input
 
-- `average_score` / `score_mean` (float) — from `metadata.json`, `summary.json`, or CSV row (`score_mean` column in `instances_output.csv`).
+- `average_score` / `score_mean` (float) — from `metadata.json`, `summary.json`, or database row (`score_mean` column in `instances` table).
 
 ---
 

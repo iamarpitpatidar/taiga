@@ -76,6 +76,6 @@ Final verdict: **ACCEPTED** or **REJECTED**
 
 Followed by concise reasoning (2–4 sentences) citing which checks passed or failed.
 
-**CSV update:** The verdict must be persisted to `instances_output.csv`. Find the row matching `problem_id` and set: `status` = `"done"`, `qa_result` = `"accepted"` or `"rejected"` (lowercase), `qa_notes` = the reasoning text, `processed_at` = ISO 8601 timestamp. The orchestrator (qa-runner) or the instance-evaluator agent performs this update.
+**Database update:** The verdict must be persisted to the `instances` table. Find the row matching `problem_id` and set: `status` = `"done"`, `qa_result` = `"accepted"` or `"rejected"` (lowercase), `qa_notes` = the reasoning text, `processed_at` = ISO 8601 timestamp. The orchestrator (qa-runner) or the instance-evaluator agent performs this update.
 
 **Repo store (when accepted):** When the verdict is **accepted**, the instance-evaluator must also update `data/repo_store.json`: add this instance’s rubric to `processed_rubrics` for its repo (derive repo_id by stripping the trailing `-NN` from `problem_id`). No separate manual step.

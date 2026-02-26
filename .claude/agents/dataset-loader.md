@@ -28,7 +28,7 @@ Optional (if present): `selected_bugs.md`, `proposal.md` — useful for cross-ch
 
 ## Extraction Tasks
 
-**From metadata.json (or CSV row — `instances_output.csv`, score column: `score_mean`):**
+**From metadata.json (or database row — `instances` table, score column: `score_mean`):**
 - `job_id` — TAIGA run ID
 - `problem_id` — Instance ID
 - `average_score` (float) — TAIGA average detection score
@@ -79,5 +79,5 @@ Produce a single structured summary for downstream agents (especially instance-e
 ## Error Handling
 
 - If `rubric.json` is missing or malformed → add to `parse_errors`; instance-evaluator will REJECT.
-- If `metadata.json` missing but CSV/context has `score_mean` (or `average_score`) → use that for `average_score`.
+- If `metadata.json` missing but database/context has `score_mean` (or `average_score`) → use that for `average_score`.
 - If `injected_repo/` missing → add to `parse_errors`; cannot proceed.

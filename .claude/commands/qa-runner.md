@@ -1,6 +1,6 @@
 # QA Runner
 
-Orchestrates the full QA validation pipeline for Meta 800 dataset selection. Uses `instances_output.csv` as the single source of truth.
+Orchestrates the full QA validation pipeline for Meta 800 dataset selection. Uses the database (`instances` table) as the single source of truth.
 
 This command is the single source of truth for evaluating a prepared TAIGA instance.
 
@@ -27,13 +27,13 @@ This command is the single source of truth for evaluating a prepared TAIGA insta
 **Instance Directory**  
 `instances/<problem_id>/`
 
-**Injected Repository**  
+**Injected Repository**
 `<instance_dir>/injected_repo/`
 
-**CSV File**  
-`instances_output.csv`
+**Database**
+`instances` table in the project database
 
-**Repo store (automatic):**  
+**Repo store (automatic):**
 `data/repo_store.json` — built and used by `prepare_instance.py`; do not edit by hand.
 
 ---
@@ -42,14 +42,14 @@ This command is the single source of truth for evaluating a prepared TAIGA insta
 
 Use this order for a full run. `repo_store.py` is **never run as a script**; it is a **module** imported and used only by `prepare_instance.py` as below.
 
-| Step | Command / Action | Who invokes | What uses repo_store |
-|------|------------------|-------------|----------------------|
-| **1. Download** | `python prepare_instance.py download [--limit N]` | User or CI | **Yes** — at start, builds `data/repo_store.json` from CSV (repo averages). Skips rows where per-instance score not in [0.4, 0.8], **num_oscillating** present and < 3, or **repo average** (all instances of that repo) not in [0.4, 0.8]. Downloads rubric + injected repo, clones original; writes `download_status`. |
-| **2. Prefilter** | `python prepare_instance.py prefilter [--limit N]` | User or CI | **Yes** — (re)builds repo store from CSV; for each downloaded instance with empty `status`, checks num_oscillating ≥ 3, repo average in [0.4, 0.8], structural checks (metadata, rubric, dirs), and **cross-instance duplicate** (same file+function as an already-accepted instance of same repo). Rejects with `status=done`, `qa_result=rejected`, writes `result.json`. |
-| **3. QA agents** | Run dataset-loader → diff-analyzer → scoring-engine → rubric-validator → instance-evaluator (see Phases below) | User / qa-runner / orchestrator | **No** — agents read instance dirs and CSV only. |
-| **4. Update CSV + repo store** | Set `status=done`, `qa_result=accepted` or `rejected`, `qa_notes`, `processed_at` in CSV. **If accepted**, the instance-evaluator must also update `data/repo_store.json`: add this instance’s rubric to `processed_rubrics` for its repo (see instance-evaluator agent). | Instance-evaluator (or orchestrator) | **Yes when accepted** — instance-evaluator writes the accepted rubric into the store so prefilter/rubric-validator can detect duplicates later. No manual step. |
+| Step | Command / Action                                                                                                                                                                                                                                                               | Who invokes | What uses repo_store |
+|------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|----------------------|
+| **1. Download** | `python boot.py download [--limit N]`                                                                                                                                                                                                                                          | User or CI | **Yes** — at start, builds `data/repo_store.json` from database (repo averages). Skips rows where per-instance score not in [0.4, 0.8], **num_oscillating** present and < 3, or **repo average** (all instances of that repo) not in [0.4, 0.8]. Downloads rubric + injected repo, clones original; writes `download_status`. |
+| **2. Prefilter** | `python boot.py prefilter [--limit N]`                                                                                                                                                                                                                             | User or CI | **Yes** — (re)builds repo store from database; for each downloaded instance with empty `status`, checks num_oscillating ≥ 3, repo average in [0.4, 0.8], structural checks (metadata, rubric, dirs), and **cross-instance duplicate** (same file+function as an already-accepted instance of same repo). Rejects with `status=done`, `qa_result=rejected`, writes `result.json`. |
+| **3. QA agents** | Run dataset-loader → diff-analyzer → scoring-engine → rubric-validator → instance-evaluator (see Phases below)                                                                                                                                                                 | User / qa-runner / orchestrator | **No** — agents read instance dirs and database only. |
+| **4. Update database + repo store** | Set `status=done`, `qa_result=accepted` or `rejected`, `qa_notes`, `processed_at` in database. **If accepted**, the instance-evaluator must also update `data/repo_store.json`: add this instance’s rubric to `processed_rubrics` for its repo (see instance-evaluator agent). | Instance-evaluator (or orchestrator) | **Yes when accepted** — instance-evaluator writes the accepted rubric into the store so prefilter/rubric-validator can detect duplicates later. No manual step. |
 
-**Summary:** Repo store is updated **automatically**: (1) repo averages in steps 1 and 2 (download and prefilter); (2) **processed rubrics** when the instance-evaluator marks an instance **accepted** (it must write the rubric to `data/repo_store.json` in the same turn as the CSV update).
+**Summary:** Repo store is updated **automatically**: (1) repo averages in steps 1 and 2 (download and prefilter); (2) **processed rubrics** when the instance-evaluator marks an instance **accepted** (it must write the rubric to `data/repo_store.json` in the same turn as the database update).
 
 ---
 
@@ -62,21 +62,21 @@ Before beginning evaluation, verify:
    - `injected_repo/`
    - `rubric.json`
    - `metadata.json`
-3. CSV contains exactly one row matching `problem_id`.
+3. Database contains exactly one row matching `problem_id`.
 4. Row `status` is NOT `"done"`.
 5. No `QA_LOCK` file exists inside instance directory.
 6. `metadata.json` contains:
    - `problem_id`
    - `job_id`
-   - `average_score` (or `score_mean` from CSV)
+   - `average_score` (or `score_mean` from database)
 
 If any check fails → **abort immediately**.
 
 ---
 
-# CSV Schema (`instances_output.csv`)
+# Database Schema (`instances` table)
 
-**Source of truth:** `instances_output.csv` in project root. All columns below must be present (add empty columns if missing).
+**Source of truth:** `instances` table in the project database. All columns below must be present.
 
 | Column                | Description |
 |-----------------------|-------------|
@@ -106,31 +106,31 @@ If any check fails → **abort immediately**.
 Before processing:
 
 1. Create `instances/<problem_id>/QA_LOCK`.
-2. Reload CSV from disk.
+2. Query database for current record.
 3. Confirm `status` is empty.
 4. Set `status = in_progress`.
-5. Save CSV.
-6. Re-open CSV and verify write succeeded.
+5. Update database.
+6. Query again and verify write succeeded.
 
 If verification fails → abort and remove lock.
 
 After processing:
 
 - Remove `QA_LOCK`.
-- Update CSV atomically.
+- Update database atomically.
 
 ---
 
-# Atomic CSV Update Rules
+# Atomic Database Update Rules
 
 Before writing:
 
-1. Reload CSV fresh.
+1. Query database for fresh data.
 2. Confirm exactly one row matches.
 3. Confirm row is still `in_progress`.
 4. Apply changes only to that row.
-5. Save entire CSV.
-6. Immediately re-open and verify:
+5. Update database record.
+6. Immediately query again and verify:
    - status == done
    - qa_result set
    - processed_at valid ISO timestamp
@@ -149,7 +149,7 @@ Reject immediately if any condition holds:
 - Rubric does not contain exactly **8 criteria**.
 - `score_mean` outside **0.4–0.8**.
 - `num_oscillating` is present, numeric, and **< 3**.
-- **Repo average** score (mean of `score_mean` across ALL instances of the same repo in CSV) outside **[0.4, 0.8]**. Computed once at pipeline start by `prepare_instance.py prefilter`.
+- **Repo average** score (mean of `score_mean` across ALL instances of the same repo in database) outside **[0.4, 0.8]**. Computed once at pipeline start by `prepare_instance.py prefilter`.
 - **Duplicate bug location**: any rubric criterion targets the same (file, function/symbol) as an already-accepted instance of the same repo (stored in `data/repo_store.json`).
 - `injected_repo/` missing.
 - More than 25% of **source** files differ structurally (excluding packaging artifacts).
@@ -173,7 +173,7 @@ If rejected during pre-check:
 - Add clear reason in `qa_notes`
 - Set `status = done`
 - Set `processed_at`
-- Save CSV
+- Update database
 - Remove lock
 - Stop execution
 
@@ -265,7 +265,7 @@ Before proceeding to Phase 2, check for **hard failures** that make further anal
 | `files_changed_count > 20` AND structural flags present | diff-analyzer | **REJECT immediately** — skip remaining phases |
 
 If early termination triggers:
-1. Set `qa_result = rejected`, `status = done` in CSV.
+1. Set `qa_result = rejected`, `status = done` in database.
 2. Write `result.json` to instance directory with reason.
 3. Remove lock and move to next instance.
 
@@ -349,7 +349,7 @@ The pipeline supports automatic sequential processing of all pending instances.
 
 ## Parallel Worker Distribution
 
-For team-based parallel processing, divide the CSV into chunks using `--offset` and `--limit`:
+For team-based parallel processing, divide the database records into chunks using `--offset` and `--limit`:
 
 ```
 Person 1: /qa-runner --offset 0   --limit 55    # rows 0-54
@@ -359,7 +359,7 @@ Person 4: /qa-runner --offset 165 --limit 55    # rows 165-219
 Person 5: /qa-runner --offset 220 --limit 52    # rows 220-271
 ```
 
-Each worker operates on independent rows. CSV locking ensures no conflicts on the shared file.
+Each worker operates on independent rows. Database transactions ensure no conflicts.
 
 ## Batch Loop Logic
 
@@ -367,31 +367,31 @@ When no explicit `problem_id` is provided:
 
 ```
 OUTER LOOP (continuous polling):
-  1. Load CSV fresh from disk
+  1. Query database for fresh data
   2. Filter rows where: status is empty AND download_status == "downloaded"
   3. Apply --offset and --limit if specified
   4. If no rows found:
      - Print "No pending instances, waiting for downloads..."
      - Sleep 10 seconds
-     - GOTO step 1 (reload CSV and check again)
+     - GOTO step 1 (reload database and check again)
 
-  5. FOR EACH pending row (in CSV order):
+  5. FOR EACH pending row (in order):
      a. Read problem_id and job_id from row
      b. Check instance directory exists (instances/<problem_id>/<job_id>/)
         - If missing → mark as rejected ("instance directory not found"), continue
-     c. Set status = "in_progress", save CSV
+     c. Set status = "in_progress", update database
      d. Create QA_LOCK
      e. Run full QA pipeline (Phase 1 → Early Termination check → Phase 2 → Phase 3)
-     f. Update CSV with verdict
+     f. Update database with verdict
      g. Write result.json
      h. Remove QA_LOCK
      i. **Cleanup processed instance:** Run `.claude/scripts/cleanup_instance.sh <problem_id> <job_id>`
      j. Print progress: "[N processed] problem_id → verdict (Xs)"
-     k. **Reload CSV and check for new downloads** (GOTO step 1)
+     k. **Query database and check for new downloads** (GOTO step 1)
 
   6. After processing all available rows:
      - Print current summary: "X accepted, Y rejected, Z total processed"
-     - GOTO step 1 (reload CSV and check for more)
+     - GOTO step 1 (query database and check for more)
 
 EXIT CONDITIONS:
   - User manually interrupts (Ctrl+C)
@@ -429,7 +429,7 @@ The pipeline runs in **continuous polling mode** and only stops when:
 **IMPORTANT:** The pipeline never exits automatically. It continuously:
 1. Processes all available downloaded instances
 2. Waits 10 seconds when queue is empty
-3. Reloads CSV to check for new downloads
+3. Queries database to check for new downloads
 4. Repeats indefinitely
 
 This allows qa-runner to work in parallel with prepare_instance.py downloads.
@@ -442,7 +442,7 @@ Each run must:
 
 - Print structured summary.
 - Record reasoning in qa_notes (2–4 sentences).
-- Avoid verbose token-heavy analysis in CSV.
+- Avoid verbose token-heavy analysis in database records.
 
 ---
 
@@ -462,3 +462,5 @@ The `result.json` file persists in the instance directory and contains the compl
 When the instance-evaluator marks an instance **accepted**, it must also update `data/repo_store.json` (add this instance’s rubric to `processed_rubrics` for its repo) so future instances can be duplicate-checked—no separate manual step.
 
 Instance is now finalized for Meta 800 selection pipeline.
+
+--limit 1

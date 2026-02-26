@@ -79,7 +79,7 @@ Use this as the canonical reference. Apply it before any qualitative reasoning.
 
 ## Output
 
-Return verdict and reasoning. **The verdict must always result in a CSV update**—either by this agent (if it writes directly) or by the orchestrator (qa-runner / Python). The CSV is the source of truth for QA state.
+Return verdict and reasoning. **The verdict must always result in a database update**—either by this agent (if it writes directly) or by the orchestrator (qa-runner / Python). The database is the source of truth for QA state.
 
 ---
 
@@ -120,27 +120,27 @@ This serves as a persistent log per instance. It can be used for debugging, audi
 
 ---
 
-## CSV Update (Mandatory)
+## Database Update (Mandatory)
 
-The verdict (`ACCEPTED` or `REJECTED`) must be persisted to the CSV. Whoever executes the update (this agent or the orchestrator) must:
+The verdict (`ACCEPTED` or `REJECTED`) must be persisted to the database. Whoever executes the update (this agent or the orchestrator) must:
 
-**File:** `instances_output.csv`
+**Table:** `instances`
 
 **Find** the row where `problem_id` matches.
 
 **Set:**
 - `status` = `"done"`
-- `qa_result` = `"accepted"` or `"rejected"` (lowercase, to match CSV column)
+- `qa_result` = `"accepted"` or `"rejected"` (lowercase)
 - `qa_notes` = short reasoning (2–4 sentences)
 - `processed_at` = ISO 8601 timestamp (UTC)
 
-**Save** the file. Do not modify other rows. Ensure the update is persisted before considering the workflow complete.
+**Update** the record. Do not modify other rows. Ensure the update is persisted before considering the workflow complete.
 
 ---
 
 ## Repo Store Update (Mandatory when ACCEPTED)
 
-When the verdict is **ACCEPTED**, you **must** update the repo store so future instances of the same repo can be checked for duplicate bug locations. Do this in the same turn as the CSV update.
+When the verdict is **ACCEPTED**, you **must** update the repo store so future instances of the same repo can be checked for duplicate bug locations. Do this in the same turn as the database update.
 
 **Steps:**
 

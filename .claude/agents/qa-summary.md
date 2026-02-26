@@ -3,7 +3,7 @@ name: qa-summary
 description: Aggregates QA statistics across processed instances
 ---
 
-Read entire instances_output.csv (score column: `score_mean`)
+Read entire instances table from database (score column: `score_mean`)
 
 Compute:
 - Total processed
