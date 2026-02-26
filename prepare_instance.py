@@ -314,7 +314,7 @@ def download_preloaded_files(problem_version_id, dest_path, progress_callback=No
     return downloaded
 
 
-def extract_injected_repo(tar_path, dest_dir):
+def extract_injected_repo(tar_path, dest_dir, silent=True):
     """Extract the repo from the tar.gz, flattening the deep path structure."""
     dest_dir.mkdir(exist_ok=True)
     with tarfile.open(tar_path, "r:gz") as tar:
@@ -335,10 +335,10 @@ def extract_injected_repo(tar_path, dest_dir):
                 if m.name:
                     tar.extract(m, dest_dir, filter='data')
 
-    post_extraction_fixes(dest_dir)
+    post_extraction_fixes(dest_dir, silent=silent)
 
 
-def post_extraction_fixes(repo_dir):
+def post_extraction_fixes(repo_dir, silent=True):
     """Fix common extraction artifacts that break QA analysis."""
     fixes_applied = []
 
@@ -381,7 +381,7 @@ def post_extraction_fixes(repo_dir):
             artifact_path.unlink()
             fixes_applied.append(f"removed empty artifact: {artifact}")
 
-    if fixes_applied:
+    if fixes_applied and not silent:
         print(f"  Post-extraction fixes applied ({len(fixes_applied)}):")
         for fix in fixes_applied:
             print(f"    - {fix}")
@@ -471,7 +471,7 @@ def prepare_one(problem_id, job_id, avg_score, show_details=False, progress_call
     if progress_callback:
         progress_callback(90, 100, "extracting repo")
     injected_repo_dir = instance_dir / "injected_repo"
-    extract_injected_repo(tar_path, injected_repo_dir)
+    extract_injected_repo(tar_path, injected_repo_dir, silent=True)
     tar_path.unlink()
 
     file_count = sum(1 for _ in injected_repo_dir.rglob("*") if _.is_file())
@@ -731,9 +731,23 @@ def main(limit=None, parallel=10, max_retries=3):
     def display_progress():
         """Background thread to display active downloads."""
         while not stop_display[0]:
-            if last_display_lines[0] > 0:
-                clear_lines(last_display_lines[0])
-            last_display_lines[0] = print_active_downloads(active_downloads, active_lock)
+            # Check if there are active downloads without locking
+            has_active = False
+            with active_lock:
+                has_active = len(active_downloads) > 0
+
+            if has_active:
+                # Clear previous display
+                if last_display_lines[0] > 0:
+                    clear_lines(last_display_lines[0])
+                # Print new display
+                last_display_lines[0] = print_active_downloads(active_downloads, active_lock)
+            else:
+                # Clear display if no active downloads
+                if last_display_lines[0] > 0:
+                    clear_lines(last_display_lines[0])
+                    last_display_lines[0] = 0
+
             time.sleep(1)  # Update every second
 
     # Start display thread
@@ -769,6 +783,9 @@ def main(limit=None, parallel=10, max_retries=3):
                 details = f"exception: {str(e)[:40]}"
                 result = None
 
+            # Remove completed future from tracking
+            del futures[future]
+
             # Progress indicator
             progress_pct = (current_count / len(to_process)) * 100
             progress_bar = f"{Colors.DIM}[{current_count:4d}/{len(to_process):4d}]{Colors.RESET} {Colors.BOLD}{progress_pct:6.2f}%{Colors.RESET}"
@@ -791,18 +808,19 @@ def main(limit=None, parallel=10, max_retries=3):
             line = format_status(status, problem_id, details, progress_bar)
             if status == 'OK':
                 line += f" {eta_str}"
-            print(line)
+            print(line, flush=True)
 
             # Save CSV after each completion
             df.to_csv(CSV_PATH, index=False)
 
-            # Submit next task if available
+            # Submit next task if available to keep pool full
             try:
-                idx = next(indices_iter)
-                row = df.loc[idx]
-                new_future = submit_task(executor, idx, row)
-                futures[new_future] = idx
+                next_idx = next(indices_iter)
+                next_row = df.loc[next_idx]
+                new_future = submit_task(executor, next_idx, next_row)
+                futures[new_future] = next_idx
             except StopIteration:
+                # No more tasks to submit
                 pass
 
     # Stop display thread
