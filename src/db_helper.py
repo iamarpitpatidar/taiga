@@ -32,14 +32,24 @@ def get_db():
 # Instance Database Operations
 # ---------------------------------------------------
 
-def get_instances_to_process(limit=None):
-    """Get instances that need to be downloaded."""
+def get_instances_to_process(limit=None, start_id=None):
+    """Get instances that need to be downloaded.
+
+    Args:
+        limit: Max number of instances to return
+        start_id: Start from this ID (inclusive) and process subsequent IDs
+    """
     with get_db() as conn:
         query = """
             SELECT * FROM instances
-            WHERE download_status != 'downloaded' OR download_status = ''
-            ORDER BY id
+            WHERE (download_status != 'downloaded' OR download_status = '')
         """
+
+        if start_id is not None:
+            query += f" AND id >= {start_id}"
+
+        query += " ORDER BY id"
+
         if limit:
             query += f" LIMIT {limit}"
 

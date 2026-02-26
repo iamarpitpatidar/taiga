@@ -655,7 +655,7 @@ def process_single_instance(row, stats_lock, stats, processed_count_lock, proces
                 db_helper.update_download_status(problem_id, f"error: {last_error[:100]}")
                 return ('FAIL', problem_id, f"{error_msg} (retry:{max_retries})", None)
 
-def main(limit=None, parallel=10, max_retries=3):
+def main(limit=None, parallel=10, max_retries=3, start_id=None):
     """Process instances from database in parallel with retry logic.
     Applies same score/num_oscillating/repo-average filters as prefilter so we
     only download instances that can pass prefilter.
@@ -664,6 +664,7 @@ def main(limit=None, parallel=10, max_retries=3):
         limit: Max instances to process
         parallel: Number of parallel workers (default 10)
         max_retries: Max retry attempts per instance (default 3)
+        start_id: Start from this ID (inclusive) and process subsequent IDs
     """
     if not DB_PATH.exists():
         raise FileNotFoundError(f"Database not found: {DB_PATH}")
@@ -672,7 +673,7 @@ def main(limit=None, parallel=10, max_retries=3):
     db_helper.build_repo_store()
 
     total = db_helper.get_instance_count()
-    to_process = db_helper.get_instances_to_process(limit=limit)
+    to_process = db_helper.get_instances_to_process(limit=limit, start_id=start_id)
     already_downloaded = db_helper.get_downloaded_count()
 
     print_header("TAIGA Instance Downloader (Parallel Mode)", 80)
@@ -680,6 +681,8 @@ def main(limit=None, parallel=10, max_retries=3):
     print(f"  Total instances:         {Colors.CYAN}{total:,}{Colors.RESET}")
     print(f"  Already downloaded:      {Colors.GREEN}{already_downloaded:,}{Colors.RESET}")
     print(f"  To process:              {Colors.YELLOW}{len(to_process):,}{Colors.RESET}{f' {Colors.DIM}(limit={limit}){Colors.RESET}' if limit else ''}")
+    if start_id is not None:
+        print(f"  Starting from ID:        {Colors.CYAN}{start_id}{Colors.RESET}")
     print(f"  Parallel workers:        {Colors.CYAN}{parallel}{Colors.RESET}")
     print(f"  Max retries:             {Colors.CYAN}{max_retries}{Colors.RESET}")
     print_footer(80)
@@ -1124,6 +1127,8 @@ if __name__ == "__main__":
                              "'accept' to store rubric after agent acceptance")
     parser.add_argument("--limit", type=int, default=None,
                         help="Max rows to process")
+    parser.add_argument("--start-id", type=int, default=None,
+                        help="Start from this ID (inclusive) and process subsequent IDs that aren't downloaded")
     parser.add_argument("--parallel", type=int, default=10,
                         help="Number of parallel workers for downloads (default: 10)")
     parser.add_argument("--max-retries", type=int, default=3,
@@ -1135,7 +1140,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.action == "download":
-        main(limit=args.limit, parallel=args.parallel, max_retries=args.max_retries)
+        main(limit=args.limit, parallel=args.parallel, max_retries=args.max_retries, start_id=args.start_id)
     elif args.action == "prefilter":
         run_prefilter(limit=args.limit)
     elif args.action == "accept":
