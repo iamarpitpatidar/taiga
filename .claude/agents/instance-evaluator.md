@@ -29,7 +29,7 @@ Use this as the canonical reference. Apply it before any qualitative reasoning.
 | Condition | Source |
 |-----------|--------|
 | `scoring-engine` returns `"outside_range"` | score_mean < 0.4 or > 0.8 |
-| `rubric-validator` reports `early_termination: true` | hard structural failure (< 8 criteria, missing weights, paths don't exist) |
+| `rubric-validator` reports `early_termination: true` | hard structural failure (< 8 criteria minimum, missing weights, paths don't exist) |
 | `diff_classification` == `"suspicious"` | massive source rewrite, large deletion, structural reorganization (packaging artifacts excluded) |
 | `files_changed_count` > 20 **AND** structural flags present | diff-analyzer |
 | `num_oscillating` < 3 | Pre-filter rejects (handled by `prepare_instance.py prefilter`) |
@@ -48,7 +48,7 @@ Use this as the canonical reference. Apply it before any qualitative reasoning.
 
 | Check | Description |
 |-------|-------------|
-| Rubric valid | 8 entries, weight=1, paths valid. Same-file criteria allowed per multi-bug-per-file rule. |
+| Rubric valid | At least 8 entries (8 minimum, more allowed), weight=1, paths valid. Same-file criteria allowed per multi-bug-per-file rule. |
 | Score in range | [0.4, 0.8] |
 | Diff scope | `localized` or `moderate` (= acceptable) |
 | Modification quality | Small, localized modifications consistent with subtle bug injection. No large refactors, file rewrites, or structural reorganizations. |

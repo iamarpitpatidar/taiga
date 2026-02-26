@@ -193,11 +193,91 @@ The repo store is now database-backed:
 
 ---
 
-## Other Agent Scripts (TODO)
+---
 
-Consider converting:
-- ⚠️ **diff-analyzer** → 90% scriptable (file counting, line diffs, classification)
-- ⚠️ **rubric-validator** → 70% scriptable (structural checks, file existence, cross-instance duplicates)
+### 4. `analyze_diff.py` (replaces diff-analyzer agent)
 
-Keep as agents:
-- ✅ **instance-evaluator** (needs LLM reasoning for final decision)
+Fast deterministic diff analysis between injected and original repos.
+
+**Usage:**
+```bash
+python3 .claude/scripts/analyze_diff.py <injected_repo_path> [--original <original_repo_path>]
+```
+
+**What it does:**
+- Counts changed/added/deleted source files
+- Filters packaging artifacts (renamed __init__.py, missing .git/, etc.)
+- Classifies: localized (≤10 files), moderate (11-20), suspicious (>20)
+- Detects structural flags (many deletions, high percentage changed)
+
+**Exit codes:**
+- `0` = acceptable (localized or moderate)
+- `1` = suspicious (should reject)
+
+---
+
+### 5. `validate_rubric.py` (replaces rubric-validator agent)
+
+Structural validation + **core file targeting analysis** (CRITICAL).
+
+**Usage:**
+```bash
+python3 .claude/scripts/validate_rubric.py <rubric.json> <injected_repo_path>
+```
+
+**Core File Analysis:**
+Identifies the top 20-25% most important files using:
+- LOC (lines of code)
+- Import frequency (how many files import it)
+- Directory depth (shallower = more core)
+- Naming patterns (core, main, base, engine, etc.)
+
+**Critical Check:** Verifies that at least 50% of rubric bugs target core files, not peripheral code.
+
+**Exit codes:**
+- `0` = passed all checks
+- `1` = hard failure (invalid structure)
+- `2` = needs manual review (warnings present, e.g., targets peripheral files)
+
+**Example output:**
+```
+Core File Analysis:
+  Total Source Files: 228
+  Core Files (top 25%): 57
+  Rubric Targets Core: 3/8 (37.5%)
+
+⚠️  WARNING: Less than 50% of bugs target core files!
+```
+
+---
+
+### 6. `generate_qa_stats.py` (replaces qa-summary agent)
+
+Database analytics for QA processing statistics.
+
+**Usage:**
+```bash
+python3 .claude/scripts/generate_qa_stats.py [--include-pending] [--score-distribution]
+```
+
+**What it shows:**
+- Total processed, accepted, rejected
+- Acceptance rate
+- Average scores by verdict
+- Optional: pending instances, score distribution by band
+
+---
+
+## Agent Status
+
+| Component | Status | Script Location | Speedup |
+|-----------|--------|-----------------|---------|
+| dataset-loader | ✅ Replaced | validate_structure.py | ~50x |
+| scoring-engine | ✅ Replaced | check_score.py | ~200x |
+| diff-analyzer | ✅ Replaced | analyze_diff.py | ~50x |
+| rubric-validator | ✅ Replaced | validate_rubric.py | ~40x (structural) |
+| qa-summary | ✅ Replaced | generate_qa_stats.py | ~100x |
+| instance-evaluator | ⚠️ Keep as agent | - | Needs LLM reasoning |
+
+**Total time saved per instance:** ~18 seconds
+**For 270 instances:** ~81 minutes saved + massive API cost reduction

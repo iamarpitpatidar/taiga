@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import sqlite3
@@ -53,20 +53,16 @@ def get_pending(conn, offset=0, limit=None):
     found = []
     for r in rows:
         pid, jid = r["problem_id"], r["job_id"]
-        for path in [
-            INSTANCES_DIR / pid / jid,
-            INSTANCES_DIR / pid,
-        ]:
-            if path.exists():
-                found.append({
-                    "problem_id": pid,
-                    "job_id": jid,
-                    "path": str(path),
-                    "score_mean": r["score_mean"],
-                    "num_oscillating": r["num_oscillating"],
-                    "rubric_json": r["rubric_json"],
-                })
-                break
+        path = INSTANCES_DIR / pid / jid
+        if path.exists():
+            found.append({
+                "problem_id": pid,
+                "job_id": jid,
+                "path": str(path),
+                "score_mean": r["score_mean"],
+                "num_oscillating": r["num_oscillating"],
+                "rubric_json": r["rubric_json"],
+            })
     if offset:
         found = found[offset:]
     if limit:
@@ -389,7 +385,7 @@ def process_instance(row):
 
     # ── Phase 1a: validate_structure ──
     rc, stdout, stderr = run_script(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "validate_structure.py"), instance_path]
+        [sys.executable, str(PROJECT_ROOT / ".claude" / "scripts" / "validate_structure.py"), instance_path]
     )
     if rc != 0:
         return "rejected", f"validate_structure failed: {stderr[:200]}", time.time() - t0
@@ -427,7 +423,7 @@ def process_instance(row):
     rc, stdout, stderr = run_script(
         [
             sys.executable,
-            str(PROJECT_ROOT / "scripts" / "check_score.py"),
+            str(PROJECT_ROOT / ".claude" / "scripts" / "check_score.py"),
             "--metadata", str(meta_path),
             "--output", "json",
         ]
@@ -505,6 +501,8 @@ def main(offset=0, limit=None):
                 verdict = "rejected"
                 notes = f"error: {e}"
                 elapsed = time.time() - t0
+
+            if verdict == "rejected":
                 finalize(problem_id, job_id, instance_path, verdict, notes)
                 release_lock(instance_path)
 

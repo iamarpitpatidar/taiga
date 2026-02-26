@@ -19,7 +19,7 @@ The rubric-validator ensures the rubric is well-formed and that its criteria are
 
 1. Top-level key `"rubric"` exists.
 2. `rubric` is an array.
-3. Exactly 8 entries.
+3. **At least 8 entries** (minimum 8, can have more).
 4. Each entry has:
    - `criterion` (non-empty string)
    - `weight` (must be 1)
@@ -75,27 +75,38 @@ Flag as invalid if:
 
 ---
 
-## Cross-Instance Duplicate Check (via Database)
+## Cross-Instance Duplicate Check (via Database + LLM Reasoning)
 
-After structural and content checks pass, check for **cross-instance bug duplication** against already-accepted instances of the same repo.
+After structural and content checks pass, check for **semantic bug duplication** against already-accepted instances of the same repo.
+
+**Important:** Use LLM reasoning for duplicate detection, not just location matching. The agent should understand the MEANING of rubrics, not just file paths.
 
 **How:**
 1. Derive `repo_id` from `problem_id` (strip trailing `-NN`).
 2. Query database for prior accepted rubrics:
    ```python
-   from src.db_helper import get_prior_rubrics, get_repo_id
+   from src.db_helper import get_prior_rubrics, get_repo_id, get_instance_by_problem_id
 
    repo_id = get_repo_id(problem_id)
    prior_rubrics = get_prior_rubrics(repo_id, exclude_problem_id=problem_id)
    ```
-3. For each criterion in the **current** rubric, extract (file path, function/symbol) from the text using regex patterns.
-4. For each criterion in **prior** rubrics, extract the same.
-5. If any current criterion matches a prior one on **(file path, function/symbol)** → flag as `cross_instance_duplicate`.
+3. Use LLM to compare current rubric against prior rubrics semantically.
+4. If duplicates found:
+   - Get current instance score: `current = get_instance_by_problem_id(problem_id)`
+   - Compare scores: **LOWER score = BETTER for training** (harder to detect)
+   - If `current.score_mean < prior.score_mean`: **ACCEPT current, mark prior for retroactive rejection**
+   - If `current.score_mean > prior.score_mean`: **REJECT current, keep prior**
 
-**Alternative:** Use the helper script:
+**Quality-based resolution:**
+- Lower scores (0.4-0.5) = bugs are harder to detect = better for model training
+- When duplicate found, always keep the instance with LOWER score
+- Retroactively update database to reject inferior duplicates
+
+**Basic location check (optional):** Use helper script for quick pre-filter:
 ```bash
 python .claude/scripts/check_rubric_duplicates.py <problem_id> instances/<problem_id>/<job_id>/rubric.json
 ```
+But always follow up with LLM semantic analysis.
 
 **Matching rules:**
 - Match is by **location only** (same file + same function). Wording can differ.
@@ -104,15 +115,20 @@ python .claude/scripts/check_rubric_duplicates.py <problem_id> instances/<proble
 - If a criterion has a file path but no function, match on file path alone.
 - If a criterion has a function but no file path, match on function alone.
 
-**Quality-based duplicate resolution:**
-- When duplicates are found, compare the quality (score) of the current instance vs prior instances.
-- Quality metric: distance from ideal score of 0.5 (closer is better).
-- If current instance has better quality than ALL conflicting instances:
+**Quality-based duplicate resolution (CRITICAL):**
+- When duplicates are found, compare the score of the current instance vs prior instances.
+- **Quality metric: LOWER score = BETTER for training** (0.4-0.5 = ideal, harder to detect)
+- If current instance has LOWER score than ALL conflicting instances:
   - **Accept** the current instance
-  - **Mark prior instances for denial** (they will be retroactively rejected)
+  - **Mark prior instances for retroactive rejection** (update database: `qa_result='rejected'`)
   - Update repo store to replace inferior rubrics
 - Otherwise:
-  - **Reject** the current instance (keep the better quality one)
+  - **Reject** the current instance (keep the lower scoring one)
+
+**Why lower is better:**
+- Score 0.4 = bug is hard to detect = good training signal
+- Score 0.7 = bug is easy to detect = weaker training signal
+- Model learns more from difficult examples
 
 **Result:**
 - If no prior rubrics exist for this repo → skip this check (always pass first instance).
@@ -137,8 +153,7 @@ Stop validation and return `rubric_valid: false` immediately if any:
 |-----------|--------|
 | `rubric` key missing | Malformed file |
 | Not an array | Malformed structure |
-| Fewer than 8 entries | Incomplete rubric |
-| More than 8 entries | Non-standard rubric |
+| Fewer than 8 entries | Incomplete rubric (minimum is 8) |
 | Any entry missing `weight` field | Structural failure |
 | Any entry has `weight != 1` | Non-standard weighting |
 | Any entry missing `criterion` field | Empty criterion |

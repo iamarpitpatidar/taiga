@@ -154,7 +154,7 @@ Never modify other rows.
 Reject immediately if any condition holds:
 
 - `rubric.json` cannot be parsed.
-- Rubric does not contain exactly **8 criteria**.
+- Rubric contains fewer than **8 criteria** (minimum is 8, more allowed).
 - `score_mean` outside **0.4–0.8**.
 - `num_oscillating` is present, numeric, and **< 3**.
 - **Repo average** score (mean of `score_mean` across ALL instances of the same repo in database) outside **[0.4, 0.8]**. Computed once at pipeline start by `prepare_instance.py prefilter`.
@@ -238,17 +238,19 @@ Output (canonical schema):
 **Performance:** ~50-100ms (script) vs ~3-5s (agent)
 
 ### 1b. Diff Analysis
-**Agent:** diff-analyzer
+**Script:** `.claude/scripts/analyze_diff.py` (replaces diff-analyzer agent)
 
 Responsibilities:
-- Compare injected vs original
-- Compute changed file count
+- Compare injected vs original (if available)
+- Count changed files (source files only, excluding packaging artifacts)
 - Estimate line modifications
-- Detect structural rewrite
+- Detect structural rewrites
 - Classify diff: `localized` | `moderate` (= acceptable) or `suspicious`
 
 Output:
-- changed_files, changed_lines_estimate, diff_classification, flags, evasion_risk
+- changed_files, changed_lines_estimate, diff_classification, flags, packaging_artifacts
+
+**Performance:** ~100-200ms (script) vs ~5-7s (agent)
 
 ### 1c. Score Validation
 **Script:** `.claude/scripts/check_score.py` (replaces scoring-engine agent)
@@ -272,7 +274,7 @@ Before proceeding to Phase 2, check for **hard failures** that make further anal
 |-----------|--------|--------|
 | `diff_classification == "suspicious"` | diff-analyzer | **REJECT immediately** — skip remaining phases |
 | `score_classification == "outside_range"` | scoring-engine | **REJECT immediately** — skip remaining phases |
-| `rubric_entry_count != 8` | dataset-loader | **REJECT immediately** — skip remaining phases |
+| `rubric_entry_count < 8` | dataset-loader | **REJECT immediately** — skip remaining phases |
 | `parse_errors` non-empty | dataset-loader | **REJECT immediately** — skip remaining phases |
 | `files_changed_count > 20` AND structural flags present | diff-analyzer | **REJECT immediately** — skip remaining phases |
 
@@ -287,19 +289,26 @@ This saves significant time by avoiding rubric deep-analysis and LLM reasoning o
 
 ## Phase 2 — Rubric Deep Validation (requires diff-analyzer output)
 
-**Agent:** rubric-validator
+**Script:** `.claude/scripts/validate_rubric.py` (replaces rubric-validator agent for structural checks)
 
 Responsibilities:
 - Confirm 8 criteria with valid structure
 - Ensure each criterion references a real file
-- Map criteria to changed files from diff-analyzer
+- **Critical: Identify core files (top 20-25% by importance) and verify rubric targets them**
+- Core file detection uses: LOC, import frequency, directory depth, naming patterns
+- Pattern-based quality checks (line numbers, diff language, self-describing keywords)
 - Apply multi-bug-per-file rule (soft — allowed for small repos)
 - Check for early termination triggers (missing weights, invalid paths)
 
 Output:
 - rubric_valid: true/false
 - early_termination: true/false
-- rubric_issues: list
+- core_analysis: {core_files_count, rubric_targets_core, core_targeting_percentage}
+- needs_manual_review: true if warnings present
+
+**Performance:** ~50-100ms (script) for structural validation
+
+**Note:** Returns exit code 2 if needs manual LLM review for subjective quality checks
 
 ---
 
@@ -333,7 +342,7 @@ Output:
 
 Before marking as accepted, confirm:
 
-1. Exactly 8 rubric criteria.
+1. At least 8 rubric criteria (8 minimum, more allowed).
 2. Diff classified as acceptable (localized | moderate).
 3. No structural rewrite (small, localized modifications only; no large refactors, file rewrites, or structural reorganizations).
 4. Score within range.

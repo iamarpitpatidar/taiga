@@ -6,7 +6,7 @@ Evaluate whether a TAIGA dataset instance is suitable for Meta inclusion.
 
 An instance must:
 
-- Have exactly 8 rubric criteria
+- Have at least 8 rubric criteria (8 minimum, more allowed)
 - Have realistic and localized bugs
 - Not contain structural sabotage
 - Not modify excessive files
@@ -31,7 +31,7 @@ The single most predictive factor: the code change should look like an **intenti
 
 ACCEPT if:
 
-1. Rubric contains exactly 8 entries (criterion + weight=1 each).
+1. Rubric contains at least 8 entries (minimum 8, more allowed; criterion + weight=1 each).
 2. Diff appears localized (≤ 20 files).
 3. Changes resemble realistic engineering mistakes (per Golden Rule).
 4. No massive deletions or rewrites.
