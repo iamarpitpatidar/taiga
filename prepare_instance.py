@@ -28,7 +28,7 @@ import time
 from datetime import datetime
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from threading import Lock, Thread
 
 # ---------------------------------------------------
@@ -759,69 +759,77 @@ def main(limit=None, parallel=10, max_retries=3):
         futures = {}
         indices_iter = iter(to_process.index)
 
-        for _ in range(min(parallel, len(to_process))):
-            try:
-                idx = next(indices_iter)
-                row = df.loc[idx]
-                future = submit_task(executor, idx, row)
-                futures[future] = idx
-            except StopIteration:
-                break
+        # Keep submitting tasks to maintain full pool
+        def submit_more_tasks(count):
+            """Submit up to 'count' new tasks."""
+            submitted = 0
+            for _ in range(count):
+                try:
+                    idx = next(indices_iter)
+                    row = df.loc[idx]
+                    future = submit_task(executor, idx, row)
+                    futures[future] = idx
+                    submitted += 1
+                except StopIteration:
+                    break
+            return submitted
+
+        # Submit initial batch
+        submit_more_tasks(parallel)
 
         # Process results as they complete
-        for future in as_completed(futures):
-            with processed_count_lock:
-                processed_count[0] += 1
-                current_count = processed_count[0]
+        while futures:  # Continue while there are pending futures
+            # Wait for at least one to complete
+            done, pending = wait(futures.keys(), return_when='FIRST_COMPLETED', timeout=1)
 
-            # Get result
-            try:
-                status, problem_id, details, result = future.result()
-            except Exception as e:
-                status = 'FAIL'
-                problem_id = f"unknown_{futures[future]}"
-                details = f"exception: {str(e)[:40]}"
-                result = None
+            for future in done:
+                with processed_count_lock:
+                    processed_count[0] += 1
+                    current_count = processed_count[0]
 
-            # Remove completed future from tracking
-            del futures[future]
+                # Get result
+                try:
+                    status, problem_id, details, result = future.result()
+                except Exception as e:
+                    status = 'FAIL'
+                    problem_id = f"unknown_{futures.get(future, 'unknown')}"
+                    details = f"exception: {str(e)[:40]}"
+                    result = None
 
-            # Progress indicator
-            progress_pct = (current_count / len(to_process)) * 100
-            progress_bar = f"{Colors.DIM}[{current_count:4d}/{len(to_process):4d}]{Colors.RESET} {Colors.BOLD}{progress_pct:6.2f}%{Colors.RESET}"
+                # Remove completed future from tracking
+                del futures[future]
 
-            # Estimate time remaining
-            elapsed = time.time() - start_time
-            if current_count > 0:
-                avg_time_per_item = elapsed / current_count
-                remaining_items = len(to_process) - current_count
-                eta_seconds = avg_time_per_item * remaining_items
-                eta_str = f"{Colors.DIM}ETA: {format_duration(eta_seconds)}{Colors.RESET}"
-            else:
-                eta_str = ""
+                # Progress indicator
+                progress_pct = (current_count / len(to_process)) * 100
+                progress_bar = f"{Colors.DIM}[{current_count:4d}/{len(to_process):4d}]{Colors.RESET} {Colors.BOLD}{progress_pct:6.2f}%{Colors.RESET}"
 
-            # Clear display and print result
-            if last_display_lines[0] > 0:
-                clear_lines(last_display_lines[0])
-                last_display_lines[0] = 0
+                # Estimate time remaining
+                elapsed = time.time() - start_time
+                if current_count > 0:
+                    avg_time_per_item = elapsed / current_count
+                    remaining_items = len(to_process) - current_count
+                    eta_seconds = avg_time_per_item * remaining_items
+                    eta_str = f"{Colors.DIM}ETA: {format_duration(eta_seconds)}{Colors.RESET}"
+                else:
+                    eta_str = ""
 
-            line = format_status(status, problem_id, details, progress_bar)
-            if status == 'OK':
-                line += f" {eta_str}"
-            print(line, flush=True)
+                # Clear display and print result
+                if last_display_lines[0] > 0:
+                    clear_lines(last_display_lines[0])
+                    last_display_lines[0] = 0
 
-            # Save CSV after each completion
-            df.to_csv(CSV_PATH, index=False)
+                line = format_status(status, problem_id, details, progress_bar)
+                if status == 'OK':
+                    line += f" {eta_str}"
+                print(line, flush=True)
 
-            # Submit next task if available to keep pool full
-            try:
-                next_idx = next(indices_iter)
-                next_row = df.loc[next_idx]
-                new_future = submit_task(executor, next_idx, next_row)
-                futures[new_future] = next_idx
-            except StopIteration:
-                # No more tasks to submit
-                pass
+                # Save CSV after each completion
+                df.to_csv(CSV_PATH, index=False)
+
+            # After processing completed futures, submit more to keep pool full
+            slots_available = parallel - len(futures)
+            if slots_available > 0:
+                submit_more_tasks(slots_available)
 
     # Stop display thread
     stop_display[0] = True
