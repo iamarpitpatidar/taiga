@@ -366,22 +366,36 @@ Each worker operates on independent rows. CSV locking ensures no conflicts on th
 When no explicit `problem_id` is provided:
 
 ```
-1. Load CSV
-2. Filter rows where: status is empty AND download_status == "downloaded"
-3. Apply --limit if specified
-4. FOR EACH pending row (in CSV order):
-   a. Read problem_id from row
-   b. Check instance directory exists (instances/<problem_id>/)
-      - If missing → mark as rejected ("instance directory not found"), continue
-   c. Set status = "in_progress", save CSV
-   d. Create QA_LOCK
-   e. Run full QA pipeline (Phase 1 → Early Termination check → Phase 2 → Phase 3)
-   f. Update CSV with verdict
-   g. Write result.json
-   h. Remove QA_LOCK
-   i. Print progress: "[N/total] problem_id → verdict (Xs)"
-   j. **Automatically advance to next row**
-5. Print final summary: X accepted, Y rejected, Z skipped
+OUTER LOOP (continuous polling):
+  1. Load CSV fresh from disk
+  2. Filter rows where: status is empty AND download_status == "downloaded"
+  3. Apply --offset and --limit if specified
+  4. If no rows found:
+     - Print "No pending instances, waiting for downloads..."
+     - Sleep 10 seconds
+     - GOTO step 1 (reload CSV and check again)
+
+  5. FOR EACH pending row (in CSV order):
+     a. Read problem_id and job_id from row
+     b. Check instance directory exists (instances/<problem_id>/<job_id>/)
+        - If missing → mark as rejected ("instance directory not found"), continue
+     c. Set status = "in_progress", save CSV
+     d. Create QA_LOCK
+     e. Run full QA pipeline (Phase 1 → Early Termination check → Phase 2 → Phase 3)
+     f. Update CSV with verdict
+     g. Write result.json
+     h. Remove QA_LOCK
+     i. **Cleanup processed instance:** Run `.claude/scripts/cleanup_instance.sh <problem_id> <job_id>`
+     j. Print progress: "[N processed] problem_id → verdict (Xs)"
+     k. **Reload CSV and check for new downloads** (GOTO step 1)
+
+  6. After processing all available rows:
+     - Print current summary: "X accepted, Y rejected, Z total processed"
+     - GOTO step 1 (reload CSV and check for more)
+
+EXIT CONDITIONS:
+  - User manually interrupts (Ctrl+C)
+  - Never exits automatically (continuous polling mode)
 ```
 
 ## Progress Tracking
@@ -389,8 +403,15 @@ When no explicit `problem_id` is provided:
 After each instance, print:
 
 ```
-[3/272] zarr-developers__zarr-python-07 → REJECTED (early termination: 47s)
-[4/272] scipy__scipy-12 → ACCEPTED (full pipeline: 92s)
+[Processed: 3] zarr-developers__zarr-python-07 → REJECTED (early termination: 47s)
+[Processed: 4] scipy__scipy-12 → ACCEPTED (full pipeline: 92s)
+```
+
+Print summary every 10 instances:
+```
+=== QA Summary (10 instances processed) ===
+Accepted: 6 | Rejected: 4 | Rate: 0.60
+Waiting for more downloads...
 ```
 
 ## Error Recovery
@@ -402,10 +423,16 @@ If an instance fails unexpectedly:
 
 ## Stop Conditions
 
-The batch stops only when:
-- All pending rows are processed
-- `--limit` is reached
-- User manually interrupts
+The pipeline runs in **continuous polling mode** and only stops when:
+- User manually interrupts (Ctrl+C)
+
+**IMPORTANT:** The pipeline never exits automatically. It continuously:
+1. Processes all available downloaded instances
+2. Waits 10 seconds when queue is empty
+3. Reloads CSV to check for new downloads
+4. Repeats indefinitely
+
+This allows qa-runner to work in parallel with prepare_instance.py downloads.
 
 ---
 
