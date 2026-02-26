@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+venv/
+env.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Project-specific
+qa_results/
+logs/
+*.log
+.idea
+instances
+instances.csv
+taiga-service-account.json
+env
