@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import db_helper
 INSTANCES_DIR = PROJECT_ROOT / "instances"
-DB_PATH = PROJECT_ROOT / "instances.db"
+DB_PATH = PROJECT_ROOT / "database.sqlite"
 
 MIN_OSCILLATING = 3
 
@@ -666,7 +666,7 @@ def main(limit=None, parallel=10, max_retries=3):
         max_retries: Max retry attempts per instance (default 3)
     """
     if not DB_PATH.exists():
-        raise FileNotFoundError(f"Database not found: {DB_PATH}\nRun: python migrate_to_sqlite.py")
+        raise FileNotFoundError(f"Database not found: {DB_PATH}")
 
     # Build repo store from database
     db_helper.build_repo_store()
@@ -941,7 +941,7 @@ def run_prefilter(limit=None):
         return (len(duplicates) > 0, duplicates)
 
     if not DB_PATH.exists():
-        raise FileNotFoundError(f"Database not found: {DB_PATH}\nRun: python migrate_to_sqlite.py")
+        raise FileNotFoundError(f"Database not found: {DB_PATH}")
 
     # Build repo store from database
     db_helper.build_repo_store()
