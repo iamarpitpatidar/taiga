@@ -4,6 +4,8 @@ Orchestrates the full QA validation pipeline for Meta 800 dataset selection. Use
 
 This command is the single source of truth for evaluating a prepared TAIGA instance.
 
+**⚠️ CRITICAL: Before starting, read `.claude/lessons_learned.md` to avoid common mistakes that have caused failures in the past.**
+
 ---
 
 ## Command Format
@@ -114,38 +116,115 @@ If any check fails → **abort immediately**.
 Before processing:
 
 1. Create `instances/<problem_id>/<job_id>/QA_LOCK`.
-2. Query database for current record by `job_id`.
-3. Confirm `status` is empty.
-4. Set `status = in_progress`.
-5. Update database.
-6. Query again and verify write succeeded.
+2. **Set `status = in_progress`** using:
+   ```bash
+   python .claude/scripts/update_qa_status.py <job_id> --status in_progress
+   ```
+3. **Verify write succeeded** (script returns JSON with `"success": true`).
 
 If verification fails → abort and remove lock.
 
 After processing:
 
+- **Update database atomically** using:
+  ```bash
+  python .claude/scripts/update_qa_status.py <job_id> \
+    --status done \
+    --result accepted \
+    --notes "Instance accepted. Score 0.46 in ideal range..."
+  ```
+- **Verify update succeeded** (check `"success": true` in JSON output)
+- If success, proceed to cleanup
+- If failed, ABORT and leave QA_LOCK for debugging
 - Remove `QA_LOCK`.
-- Update database atomically by `job_id`.
+
+## ⚠️ CRITICAL: Use Scripts for ALL Database Operations
+
+**NEVER write inline Python commands** to query or update the database. This causes:
+- Lost updates due to multiple connections
+- Broken transaction management
+- Inconsistent database state
+
+**ALWAYS use the update script:**
+```bash
+# ✅ Set to in_progress:
+python .claude/scripts/update_qa_status.py <job_id> --status in_progress
+
+# ✅ Mark as done (accepted):
+python .claude/scripts/update_qa_status.py <job_id> \
+  --status done --result accepted --notes "..."
+
+# ✅ Mark as failed (rejected):
+python .claude/scripts/update_qa_status.py <job_id> \
+  --status failed --result rejected --notes "Early termination: suspicious diff"
+```
+
+**Example of WRONG approach:**
+```bash
+# ❌ NEVER DO THIS:
+python -c "import sqlite3; conn = sqlite3.connect('data/database.sqlite'); ..."
+```
 
 ---
 
 # Atomic Database Update Rules
 
-Before writing:
+**CRITICAL:** Use `.claude/scripts/update_qa_status.py` for ALL status updates.
 
-1. Query database for fresh data.
-2. Confirm exactly one row matches.
-3. Confirm row is still `in_progress`.
-4. Apply changes only to that row.
-5. Update database record.
-6. Immediately query again and verify:
-   - status == done
-   - qa_result set
-   - processed_at valid ISO timestamp
+## Status Enum
+- `in_progress` - QA pipeline is running (set after creating QA_LOCK)
+- `failed` - Early termination due to hard failure (set with qa_result=rejected)
+- `done` - QA complete (set with qa_result=accepted or rejected)
 
-If verification fails → abort and notify.
+## Result Enum
+- `accepted` - Instance passed QA (only for status=done)
+- `rejected` - Instance failed QA (for status=done or status=failed)
+- `""` (empty) - No result yet (for status=in_progress)
 
-Never modify other rows.
+## Script Guarantees
+
+The script handles:
+1. Atomic updates by `job_id` (PRIMARY KEY)
+2. Transaction management (commit + verification)
+3. Status transition validation:
+   - `in_progress`: can only be set from empty status
+   - `done`/`failed`: can only be set from `in_progress`
+4. Required fields validation:
+   - `in_progress`: no result/notes required
+   - `done`/`failed`: result and notes required
+5. Error handling with rollback
+
+## Usage Examples
+
+```bash
+# 1. Start processing (after creating QA_LOCK):
+python .claude/scripts/update_qa_status.py <job_id> --status in_progress
+
+# 2a. Complete with acceptance:
+python .claude/scripts/update_qa_status.py <job_id> \
+  --status done --result accepted --notes "Instance accepted. Score 0.46..."
+
+# 2b. Complete with rejection:
+python .claude/scripts/update_qa_status.py <job_id> \
+  --status done --result rejected --notes "Rubric has only 6 criteria (minimum 8)"
+
+# 2c. Early termination (failed):
+python .claude/scripts/update_qa_status.py <job_id> \
+  --status failed --result rejected --notes "Early termination: suspicious diff"
+```
+
+## Verification Protocol
+
+After running the script:
+1. Parse JSON output
+2. Check `"success": true`
+3. If success=false → ABORT, log error, do NOT cleanup
+4. If success=true → proceed to next step
+
+**Never:**
+- Write inline Python to update database
+- Update database without checking success
+- Cleanup instance before database update succeeds
 
 ---
 
@@ -224,6 +303,11 @@ Launch **all three** of these checks in parallel:
 ### 1a. Dataset Loader
 **Script:** `.claude/scripts/validate_structure.py` (replaces dataset-loader agent)
 
+**Usage:**
+```bash
+python .claude/scripts/validate_structure.py instances/<problem_id>/<job_id>
+```
+
 Responsibilities:
 - Count rubric criteria
 - Extract metadata
@@ -237,8 +321,15 @@ Output (canonical schema):
 
 **Performance:** ~50-100ms (script) vs ~3-5s (agent)
 
+**⚠️ IMPORTANT:** Run the script and parse its JSON output. Do NOT manually verify with inline Python or grep commands unless the script fails.
+
 ### 1b. Diff Analysis
 **Script:** `.claude/scripts/analyze_diff.py` (replaces diff-analyzer agent)
+
+**Usage:**
+```bash
+python .claude/scripts/analyze_diff.py instances/<problem_id>/<job_id>
+```
 
 Responsibilities:
 - Compare injected vs original (if available)
@@ -252,8 +343,15 @@ Output:
 
 **Performance:** ~100-200ms (script) vs ~5-7s (agent)
 
+**⚠️ IMPORTANT:** Trust the script's classification. Do NOT manually verify unless the output is unclear.
+
 ### 1c. Score Validation
 **Script:** `.claude/scripts/check_score.py` (replaces scoring-engine agent)
+
+**Usage:**
+```bash
+python .claude/scripts/check_score.py --metadata instances/<problem_id>/<job_id>/metadata.json
+```
 
 Responsibilities:
 - Confirm score within 0.4–0.8
@@ -263,6 +361,8 @@ Output:
 - score_classification, score_band, remark
 
 **Performance:** ~10ms (script) vs ~2-3s (agent)
+
+**⚠️ IMPORTANT:** Use the script output directly. Do NOT manually recalculate scores.
 
 ---
 
@@ -291,6 +391,13 @@ This saves significant time by avoiding rubric deep-analysis and LLM reasoning o
 
 **Script:** `.claude/scripts/validate_rubric.py` (replaces rubric-validator agent for structural checks)
 
+**Usage:**
+```bash
+python .claude/scripts/validate_rubric.py \
+  instances/<problem_id>/<job_id>/rubric.json \
+  instances/<problem_id>/<job_id>/injected_repo
+```
+
 Responsibilities:
 - Confirm 8 criteria with valid structure
 - Ensure each criterion references a real file
@@ -310,17 +417,18 @@ Output:
 
 **Note:** Returns exit code 2 if needs manual LLM review for subjective quality checks
 
+**⚠️ IMPORTANT:** If exit code is 0, accept the validation. If exit code is 2, perform manual LLM review (but still use script output as baseline).
+
 ---
 
 ## Phase 3 — Final Decision (requires all upstream outputs)
 
-**Agent:** instance-evaluator
-
-Responsibilities:
-- Consume outputs from dataset-loader, diff-analyzer, rubric-validator, scoring-engine
+**Responsibilities:**
+- Consume outputs from validate_structure.py, analyze_diff.py, check_score.py, validate_rubric.py
 - Apply deterministic acceptance matrix
-- Apply qualitative QA Playbook checks
-- Write `result.json` to instance directory
+- Apply qualitative QA Playbook checks (manual LLM reasoning)
+- **Update database BEFORE writing result.json**
+- Write `result.json` to instance directory (optional audit log)
 
 | Condition | Verdict |
 |-----------|---------|
@@ -331,10 +439,28 @@ Responsibilities:
 | duplicate bugs (same exact mutation) | reject |
 | all checks pass | accept |
 
-Output:
-- verdict: accepted/rejected
-- reasoning: structured explanation
-- result.json written to instance directory
+**CRITICAL ORDER OF OPERATIONS:**
+
+1. Complete evaluation (accept or reject decision)
+2. **Update database** using:
+   ```bash
+   python .claude/scripts/update_qa_status.py <job_id> \
+     --status done \
+     --result accepted \
+     --notes "Instance accepted. Score 0.46 in ideal range [0.4, 0.5]. All 12 rubric criteria reference real files..."
+   ```
+3. **Verify database update succeeded** (parse JSON output, check `"success": true`)
+4. If accepted: Add rubric to repo store using `db_helper.add_accepted_rubric(repo_id, problem_id, rubric)`
+5. Write `result.json` to instance directory (optional audit log)
+6. Remove `QA_LOCK` file
+7. Run cleanup: `.claude/scripts/cleanup_instance.sh <problem_id> <job_id>`
+
+**⚠️ CRITICAL:** If step 3 verification fails (success=false), ABORT immediately:
+- Do NOT add rubric to repo store
+- Do NOT write result.json
+- Do NOT remove QA_LOCK
+- Do NOT cleanup instance
+- Log the error for debugging
 
 ---
 
@@ -484,4 +610,18 @@ When the instance-evaluator marks an instance **accepted**, it must also call `d
 
 Instance is now finalized for Meta 800 selection pipeline.
 
---limit 1
+---
+
+# Common Mistakes to Avoid
+
+**⚠️ CRITICAL: See `.claude/lessons_learned.md` for detailed examples of common agent failures and how to avoid them.**
+
+Key reminders:
+- ✅ **Use existing scripts** (`.claude/scripts/*.py`) - NEVER write inline `python -c "..."` for operations
+- ✅ **Verify database updates** - Check `"success": true` before proceeding to cleanup
+- ✅ **Database first, cleanup last** - Update database BEFORE any destructive operations
+- ✅ **Trust script outputs** - Don't over-verify with 20+ manual commands
+- ✅ **Use correct primary key** - Always use `job_id` (not `problem_id`) for updates
+- ✅ **Follow state machine** - Don't skip states (must go: empty → in_progress → done/failed)
+
+**Read `.claude/lessons_learned.md` at the start of complex tasks to avoid repeating past mistakes.**

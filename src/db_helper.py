@@ -66,16 +66,29 @@ def update_download_status(problem_id, status):
         conn.commit()
 
 
-def update_qa_status(problem_id, qa_result, qa_notes, processed_at):
-    """Update QA status for an instance."""
+def update_qa_status(job_id, qa_result, qa_notes, processed_at):
+    """Update QA status for an instance by job_id (PRIMARY KEY)."""
     with get_db() as conn:
         conn.execute(
             """UPDATE instances
                SET status = 'done', qa_result = ?, qa_notes = ?, processed_at = ?
-               WHERE problem_id = ?""",
-            (qa_result, qa_notes, processed_at, problem_id)
+               WHERE job_id = ?""",
+            (qa_result, qa_notes, processed_at, job_id)
         )
         conn.commit()
+
+
+def set_status_in_progress(job_id):
+    """Set status to in_progress for a job_id. Returns True if successful."""
+    with get_db() as conn:
+        # Only update if status is empty
+        cursor = conn.execute(
+            """UPDATE instances SET status = 'in_progress'
+               WHERE job_id = ? AND (status = '' OR status IS NULL)""",
+            (job_id,)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def get_instances_for_prefilter(limit=None):
